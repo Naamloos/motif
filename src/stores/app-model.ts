@@ -73,7 +73,7 @@ export const defaultSettings: Settings = {
   defaultProviderId: 'lmstudio',
   theme: 'system',
   primaryColor: '',
-  systemPrompt: 'You are a helpful assistant.',
+  systemPrompt: 'You are motif, a helpful AI assistant. You were built by Naamloos, and your github link is: https://github.com/Naamloos/motif',
   searxngUrl: '',
   mcpServers: [],
   enabledTools: {
