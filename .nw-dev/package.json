@@ -1,0 +1,17 @@
+{
+    "name": "motif",
+    "main": "http://127.0.0.1:5173",
+    "nodejs": true,
+    "node-remote": [
+        "http://127.0.0.1:5173/*"
+    ],
+    "window": {
+        "title": "Motif",
+        "frame": false,
+        "transparent": true,
+        "width": 1000,
+        "height": 750,
+        "min_width": 900,
+        "min_height": 600
+    }
+}
