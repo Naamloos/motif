@@ -12,7 +12,7 @@ export default function MainLayout() {
     <div
       className={
         (isSettingsPage ? 'h-screen bg-background' : 'min-h-screen bg-background pt-10') +
-        ' rounded-xl'
+        ' rounded-3xl'
       }
     >
       {!isSettingsPage && (
@@ -22,7 +22,7 @@ export default function MainLayout() {
         />
       )}
       <main
-        className={`flex ${isSettingsPage ? 'h-screen' : 'h-[calc(100vh-2.5rem)]'} min-h-0 w-full gap-4 overflow-hidden px-4`}
+        className={`flex ${isSettingsPage ? 'h-screen' : 'h-[calc(100vh-2.5rem)]'} min-h-0 w-full overflow-hidden px-4` + (sidebarOpen ? ' gap-4' : '')}
       >
         {!isSettingsPage && (
           <div
