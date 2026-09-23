@@ -2,7 +2,7 @@
 
 Motif is a desktop LLM harness for chatting with local and hosted language models. It supports multiple model providers, workspace-aware tools, image attachments, saved chats and memories, and MCP servers.
 
-Motif includes built-in support for LM Studio, Ollama, OpenAI, Anthropic, and OpenRouter. LM Studio is configured as the default provider.
+Motif includes built-in support for LM Studio, Ollama, OpenAI, Anthropic, OpenRouter, and Codex CLI. LM Studio is configured as the default provider.
 
 ## Running Motif
 
@@ -29,7 +29,15 @@ Create a production build:
 npm run build
 ```
 
-The compiled application is written to `dist/`. This command builds the application assets; it does not package a standalone desktop executable.
+The compiled application assets are written to `dist/`.
+
+Package the Windows desktop app with NW.js:
+
+```sh
+npm run build:desktop
+```
+
+The runnable app is written to `release/Motif.exe` with its NW.js runtime alongside it.
 
 ## Screenshots
 

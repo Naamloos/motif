@@ -10,19 +10,23 @@ const exec = promisify(execFile)
 export function runCommand(context: AgentToolContext) {
   return tool({
     description:
-      'Run a command with arguments in the selected chat folder. Every command requires approval.',
+      'Run a command with arguments in the selected chat folder. Command approval follows the user’s safety setting.',
     inputSchema: z.object({
       command: z.string().min(1).max(200),
       args: z.array(z.string().max(2000)).max(50).default([]),
     }),
     execute: async ({ command, args }) => {
       const approvalText = `${command} ${args.join(' ')}`.trim()
-      if (!(await context.requestApproval('Run command', approvalText))) {
+      if (
+        context.requireApprovalForCommands &&
+        !(await context.requestApproval('Run command', approvalText))
+      ) {
         return 'The user denied the command.'
       }
 
       const { stdout, stderr } = await exec(command, args, {
         cwd: context.folder ?? process.cwd(),
+        signal: context.abortSignal,
         timeout: 30_000,
         maxBuffer: 1024 * 1024,
         windowsHide: true,

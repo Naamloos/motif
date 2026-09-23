@@ -6,7 +6,7 @@ import { patchWorkspaceFile } from '@/services/workspace-access'
 export function patchFile(context: AgentToolContext) {
   return tool({
     description:
-      'Replace an exact text occurrence in a file in this chat’s selected folder. Without a folder, request approval.',
+      'Replace one unique exact text occurrence in a workspace file. Include enough surrounding lines in search to identify the target; ambiguous matches are rejected.',
     inputSchema: z.object({
       path: z.string().min(1),
       search: z.string().min(1),

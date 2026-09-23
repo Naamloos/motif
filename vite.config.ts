@@ -1,18 +1,19 @@
 import path from 'node:path'
-import { createRequire } from 'node:module'
+import { builtinModules, createRequire } from 'node:module'
 
 import react from '@vitejs/plugin-react'
 import tailwindcss from '@tailwindcss/vite'
 import { defineConfig, type Plugin } from 'vite'
 
 const require = createRequire(import.meta.url)
+const nodeBuiltins = new Set(builtinModules.flatMap((name) => [name, `node:${name}`]))
 
 const VIRTUAL_PREFIX = '\0nw-node:'
 
 /**
  * Packages that should be loaded by NW.js at runtime instead of bundled by Vite.
  *
- * Node built-ins (`node:*`) are always handled automatically.
+ * Node built-ins are always handled automatically, with or without `node:`.
  *
  * Only add packages here when they genuinely need Node/NW.js runtime behavior.
  */
@@ -23,7 +24,7 @@ const nwRuntimePackages = new Set<string>([
 ])
 
 function isNwRuntimeImport(id: string): boolean {
-  if (id.startsWith('node:')) {
+  if (id.startsWith('node:') || nodeBuiltins.has(id)) {
     return true
   }
 
@@ -129,5 +130,8 @@ export default defineConfig({
 
   build: {
     target: 'esnext',
+  },
+  optimizeDeps: {
+    exclude: ['ai-sdk-provider-codex-cli'],
   },
 })

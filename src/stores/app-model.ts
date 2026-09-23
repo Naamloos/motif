@@ -13,10 +13,34 @@ export type ToolTrace = {
 
 export type AssistantActivity =
   | { id: string; type: 'reasoning'; text: string; startedAt?: number; durationMs?: number }
+  | { id: string; type: 'text'; text: string }
   | { id: string; type: 'tool'; toolId: string }
 
 export type ChatImage = { id: string; name: string; mediaType: string; data: string }
 export type ChatTask = { id: string; text: string; complete: boolean }
+export type RunSettingsSnapshot = {
+  provider: string
+  model: string
+  reasoningEffort: ReasoningEffort
+  maxToolSteps: number
+  enabledTools: string[]
+  contextTurns: number
+  systemPrompt: string
+  memories: string[]
+  workspaceFolder?: string
+  approvalForFileChanges: boolean
+  approvalForMcpTools: boolean
+  approvalForCommands: boolean
+  approvalForBrowser: boolean
+}
+export type ToolAuditEntry = {
+  id: string
+  at: number
+  chatTitle: string
+  action: string
+  details: string
+  approved: boolean
+}
 
 export type ChatMessage = {
   id: string
@@ -32,6 +56,7 @@ export type ChatMessage = {
   outputTokens?: number
   isStreaming?: boolean
   activeActivityId?: string | null
+  runSnapshot?: RunSettingsSnapshot
 }
 
 export type Chat = {
@@ -47,12 +72,24 @@ export type Chat = {
   messages: ChatMessage[]
   modelMessages: ModelMessage[]
   generationStatus: 'idle' | 'queued' | 'generating' | 'interrupted'
+  instructions: string
+  enabledTools: Record<string, boolean>
+  useMemories: boolean
+  pinned: boolean
+  archived: boolean
+  maxToolSteps?: number
   steeringMessageId?: string | null
   updatedAt: number
 }
 
 export type Settings = {
   maxConcurrentGenerations: number
+  maxToolSteps: number
+  contextTurnLimit: number
+  requireApprovalForFileChanges: boolean
+  requireApprovalForMcpTools: boolean
+  requireApprovalForCommands: boolean
+  requireApprovalForBrowser: boolean
   unloadOtherModelsOnSwitch: boolean
   defaultProviderId: string
   providers: ProviderConfig[]
@@ -63,12 +100,19 @@ export type Settings = {
   searxngUrl: string
   mcpServers: McpServerConfig[]
   memories: string[]
+  toolAudit: ToolAuditEntry[]
 }
 
 export const maxConcurrentLimit = 8
 
 export const defaultSettings: Settings = {
   maxConcurrentGenerations: 1,
+  maxToolSteps: 15,
+  contextTurnLimit: 20,
+  requireApprovalForFileChanges: true,
+  requireApprovalForMcpTools: true,
+  requireApprovalForCommands: true,
+  requireApprovalForBrowser: true,
   unloadOtherModelsOnSwitch: true,
   defaultProviderId: 'lmstudio',
   theme: 'system',
@@ -80,19 +124,30 @@ export const defaultSettings: Settings = {
     getModelName: true,
     searchWikipedia: true,
     searchWeb: true,
+    searchNews: true,
+    searchImages: true,
     fetchWebpage: true,
     listFiles: true,
+    findFiles: true,
+    findDefinition: true,
+    getFileTree: true,
+    inspectWorkspace: true,
     searchFiles: true,
     readFile: true,
+    editFile: true,
     readDocument: true,
     writeFile: true,
     patchFile: true,
     runCommand: true,
+    git: true,
     askUser: true,
     manageTasks: true,
     searchChats: true,
     saveMemory: true,
+    manageMemories: true,
     openInBrowser: true,
+    copyToClipboard: true,
+    readClipboard: true,
     ocrImage: true,
     browserNavigate: true,
     browserInspect: true,
@@ -101,6 +156,7 @@ export const defaultSettings: Settings = {
     browserScreenshot: true,
   },
   memories: [],
+  toolAudit: [],
   providers: [
     {
       id: 'lmstudio',
@@ -137,6 +193,7 @@ const assistantActivitySchema = z.discriminatedUnion('type', [
     startedAt: z.number().optional(),
     durationMs: z.number().optional(),
   }),
+  z.object({ id: z.string(), type: z.literal('text'), text: z.string() }),
   z.object({ id: z.string(), type: z.literal('tool'), toolId: z.string() }),
 ])
 
@@ -154,12 +211,41 @@ const chatMessageSchema = z.object({
   outputTokens: z.number().int().nonnegative().optional(),
   isStreaming: z.boolean().optional(),
   activeActivityId: z.string().nullable().optional(),
+  runSnapshot: z.object({
+    provider: z.string(),
+    model: z.string(),
+    reasoningEffort: z.enum([
+      'provider-default',
+      'none',
+      'minimal',
+      'low',
+      'medium',
+      'high',
+      'xhigh',
+    ]),
+    maxToolSteps: z.number(),
+    enabledTools: z.array(z.string()),
+    contextTurns: z.number(),
+    systemPrompt: z.string(),
+    memories: z.array(z.string()),
+    workspaceFolder: z.string().optional(),
+    approvalForFileChanges: z.boolean(),
+    approvalForMcpTools: z.boolean(),
+    approvalForCommands: z.boolean().default(true),
+    approvalForBrowser: z.boolean().default(true),
+  }).optional(),
 })
 
 export const persistedDataSchema = z.object({
   version: z.literal(1),
   settings: z.object({
     maxConcurrentGenerations: z.number().int().min(1).max(maxConcurrentLimit),
+    maxToolSteps: z.number().int().min(1).max(100).default(15),
+    contextTurnLimit: z.number().int().min(1).max(100).default(20),
+    requireApprovalForFileChanges: z.boolean().default(true),
+    requireApprovalForMcpTools: z.boolean().default(true),
+    requireApprovalForCommands: z.boolean().default(true),
+    requireApprovalForBrowser: z.boolean().default(true),
     unloadOtherModelsOnSwitch: z.boolean().default(true),
     defaultProviderId: z.string(),
     theme: z.enum(['system', 'light', 'dark']).default('system'),
@@ -190,13 +276,29 @@ export const persistedDataSchema = z.object({
     enabledTools: z.record(z.string(), z.boolean()).default({
       getModelName: true,
       searchWikipedia: true,
+      searchWeb: true,
+      searchNews: true,
+      searchImages: true,
+      manageMemories: true,
     }),
     memories: z.array(z.string()).default([]),
+    toolAudit: z
+      .array(
+        z.object({
+          id: z.string(),
+          at: z.number(),
+          chatTitle: z.string(),
+          action: z.string(),
+          details: z.string(),
+          approved: z.boolean(),
+        }),
+      )
+      .default([]),
     providers: z.array(
       z.object({
         id: z.string(),
         type: z
-          .enum(['lmstudio', 'ollama', 'openai', 'anthropic', 'openrouter', 'google'])
+          .enum(['lmstudio', 'ollama', 'openai', 'anthropic', 'openrouter', 'google', 'codex-cli'])
           .default('lmstudio'),
         name: z.string(),
         kind: z.enum(['openai-compatible', 'openai', 'anthropic', 'google']),
@@ -236,6 +338,12 @@ export const persistedDataSchema = z.object({
       messages: z.array(chatMessageSchema),
       modelMessages: z.array(z.unknown()),
       generationStatus: z.enum(['idle', 'queued', 'generating', 'interrupted']),
+      instructions: z.string().default(''),
+      enabledTools: z.record(z.string(), z.boolean()).default({}),
+      useMemories: z.boolean().default(true),
+      pinned: z.boolean().default(false),
+      archived: z.boolean().default(false),
+      maxToolSteps: z.number().int().min(1).max(100).optional(),
       steeringMessageId: z.string().nullable().optional(),
       updatedAt: z.number(),
     }),
@@ -261,6 +369,11 @@ export function makeChat(settings: Settings): Chat {
     messages: [],
     modelMessages: [],
     generationStatus: 'idle',
+    instructions: '',
+    enabledTools: {},
+    useMemories: true,
+    pinned: false,
+    archived: false,
     updatedAt: Date.now(),
   }
 }

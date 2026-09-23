@@ -1,4 +1,5 @@
 import MarkdownIt from 'markdown-it'
+import type { ReactElement } from 'react'
 import {
   ChevronDown,
   Clock3,
@@ -12,6 +13,14 @@ import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip
 import type { AssistantActivity, ChatMessage, ToolTrace } from '@/stores/app-model'
 
 const markdown = new MarkdownIt({ html: false, breaks: true })
+const thinkingTexts = ['Thinking...', 'Yapping...', 'Thunking...', 'Gooning...', 'I uh I uh idk 1 sec...']
+
+markdown.renderer.rules.link_open = (tokens, index, options, _env, self) => {
+  const token = tokens[index]
+  token.attrSet('target', '_blank')
+  token.attrSet('rel', 'noopener noreferrer')
+  return self.renderToken(tokens, index, options)
+}
 
 function ResponseMetric({
   icon: Icon,
@@ -35,26 +44,87 @@ function ResponseMetric({
   )
 }
 
+function DiffViewer({ diff }: { diff: string }) {
+  const { elements: lines } = diff.split('\n').reduce(
+    (state, line, index) => {
+      let { oldLine, newLine } = state
+      const hunk = line.match(/^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/)
+      if (hunk) {
+        oldLine = Number(hunk[1])
+        newLine = Number(hunk[2])
+      }
+
+      const removed = line.startsWith('-') && !line.startsWith('--- ')
+      const added = line.startsWith('+') && !line.startsWith('+++ ')
+      const context = line.startsWith(' ')
+      const oldNumber = removed || context ? oldLine : ''
+      const newNumber = added || context ? newLine : ''
+      if (removed || context) oldLine += 1
+      if (added || context) newLine += 1
+      const color = added
+        ? 'bg-emerald-500/10 text-emerald-800 dark:text-emerald-300'
+        : removed
+          ? 'bg-red-500/10 text-red-800 dark:text-red-300'
+          : line.startsWith('@@')
+            ? 'bg-blue-500/10 text-blue-800 dark:text-blue-300'
+            : ''
+
+      return {
+        oldLine,
+        newLine,
+        elements: [
+          ...state.elements,
+          <div key={index} className={`grid grid-cols-[3rem_3rem_1fr] ${color}`}>
+            <span className="select-none px-2 text-right text-muted-foreground">{oldNumber}</span>
+            <span className="select-none px-2 text-right text-muted-foreground">{newNumber}</span>
+            <span className="whitespace-pre px-2">{line || ' '}</span>
+          </div>,
+        ],
+      }
+    },
+    { oldLine: 0, newLine: 0, elements: [] as ReactElement[] },
+  )
+
+  return (
+    <div
+      role="region"
+      aria-label="File diff"
+      tabIndex={0}
+      className="max-h-96 overflow-auto rounded-md border bg-background py-1 font-mono text-xs"
+    >
+      {lines}
+    </div>
+  )
+}
+
+function isDiffOutput(output: string) {
+  return output.startsWith('diff --git ') || /^--- a\/[^\n]*\n\+\+\+ b\//.test(output)
+}
+
 function ToolDetails({ tool, active }: { tool: ToolTrace; active: boolean }) {
   return (
     <details
       open={active}
-      className={`rounded-lg border px-3 py-2 text-sm ${active ? 'streaming-glow' : ''}`}
+      className={`min-w-0 max-w-full overflow-hidden rounded-lg border px-3 py-2 text-sm ${active ? 'streaming-glow' : ''}`}
     >
       <summary className="flex cursor-pointer list-none items-center gap-2">
         <Wrench className="size-4" aria-hidden="true" />
-        {tool.name} · {tool.status}
+        {tool.name} - {tool.status}
         {active && <LoaderCircle className="ml-auto size-4 animate-spin" aria-label="Running" />}
       </summary>
       <div className="mt-3 space-y-2">
         <div>
           <p className="text-xs text-muted-foreground">Input</p>
-          <pre className="whitespace-pre-wrap break-words">{tool.input || '…'}</pre>
+          <pre className="max-w-full whitespace-pre-wrap break-all">{tool.input || '...'}</pre>
         </div>
         {tool.output && (
           <div>
             <p className="text-xs text-muted-foreground">Output</p>
-            <pre className="whitespace-pre-wrap break-words">{tool.output}</pre>
+            {isDiffOutput(tool.output) ? (
+              <DiffViewer diff={tool.output} />
+            ) : (
+              <pre className="max-w-full whitespace-pre-wrap break-all">{tool.output}</pre>
+            )}
           </div>
         )}
       </div>
@@ -74,7 +144,7 @@ function ReasoningDetails({
 
   return (
     <details
-      className={`rounded-lg border px-3 py-2 text-sm text-muted-foreground ${active ? 'streaming-glow' : ''}`}
+      className={`min-w-0 max-w-full overflow-hidden rounded-lg border px-3 py-2 text-sm text-muted-foreground ${active ? 'streaming-glow' : ''}`}
     >
       <summary className="flex cursor-pointer list-none items-center gap-2">
         <ChevronDown className="size-4" aria-hidden="true" />
@@ -107,6 +177,10 @@ function activityFor(message: ChatMessage): AssistantActivity[] {
 }
 
 export function ChatMessageView({ message }: { message: ChatMessage }) {
+  const thinkingText = thinkingTexts[
+    Array.from(message.id).reduce((hash, character) => (hash * 31 + character.charCodeAt(0)) >>> 0, 0) %
+      thinkingTexts.length
+  ]
   if (message.role === 'user') {
     return (
       <article className="chat-message space-y-2">
@@ -129,17 +203,26 @@ export function ChatMessageView({ message }: { message: ChatMessage }) {
 
   return (
     <article className="chat-message space-y-2">
-      <div className="space-y-3">
+      <div className="min-w-0 max-w-full space-y-3">
         {activityFor(message).map((activity) => {
           const active = message.isStreaming === true && message.activeActivityId === activity.id
           if (activity.type === 'reasoning') {
             return <ReasoningDetails key={activity.id} activity={activity} active={active} />
           }
+          if (activity.type === 'text') {
+            return (
+              <div
+                key={activity.id}
+                className="markdown-content w-fit max-w-[85%] rounded-2xl bg-muted px-4 py-2"
+                dangerouslySetInnerHTML={{ __html: markdown.render(activity.text) }}
+              />
+            )
+          }
           const tool = message.tools.find((item) => item.id === activity.toolId)
           return tool ? <ToolDetails key={activity.id} tool={tool} active={active} /> : null
         })}
 
-        {message.text && (
+        {message.text && !message.activity.some((activity) => activity.type === 'text') && (
           <div
             className="markdown-content w-fit max-w-[85%] rounded-2xl bg-muted px-4 py-2"
             dangerouslySetInnerHTML={{ __html: markdown.render(message.text) }}
@@ -171,11 +254,40 @@ export function ChatMessageView({ message }: { message: ChatMessage }) {
         )}
 
         {message.error && <p className="text-sm text-destructive">{message.error}</p>}
+        {message.runSnapshot && (
+          <details className="w-fit px-1 text-xs text-muted-foreground">
+            <summary className="cursor-pointer">
+              Run settings - {message.runSnapshot.model}
+            </summary>
+            <div className="mt-1 space-y-0.5">
+              <p>Provider: {message.runSnapshot.provider}</p>
+              <p>Reasoning: {message.runSnapshot.reasoningEffort}</p>
+              <p>Tool steps: {message.runSnapshot.maxToolSteps}</p>
+              <p>Context limit: {message.runSnapshot.contextTurns} turns</p>
+              <p>Tools enabled: {message.runSnapshot.enabledTools.join(', ') || 'None'}</p>
+              <p>Workspace: {message.runSnapshot.workspaceFolder || 'None'}</p>
+              <p>
+                File change approvals: {message.runSnapshot.approvalForFileChanges ? 'On' : 'Off'}
+              </p>
+              <p>MCP approvals: {message.runSnapshot.approvalForMcpTools ? 'On' : 'Off'}</p>
+              <p>Command approvals: {message.runSnapshot.approvalForCommands ? 'On' : 'Off'}</p>
+              <p>Browser approvals: {message.runSnapshot.approvalForBrowser ? 'On' : 'Off'}</p>
+              {message.runSnapshot.memories.length > 0 && (
+                <p>Memories: {message.runSnapshot.memories.join(' - ')}</p>
+              )}
+              {message.runSnapshot.systemPrompt && (
+                <p className="max-w-lg whitespace-pre-wrap">
+                  Instructions: {message.runSnapshot.systemPrompt}
+                </p>
+              )}
+            </div>
+          </details>
+        )}
         {message.isStreaming &&
           ((!message.text && !message.reasoning) || !message.activeActivityId) && (
             <p className="flex items-center gap-2 text-sm text-muted-foreground">
               <LoaderCircle className="size-4 animate-spin" />
-              Thinking…
+              {thinkingText}
             </p>
           )}
       </div>

@@ -39,13 +39,13 @@ export function WindowTitlebar({
   }
 
   return (
-    <header className="window-drag fixed inset-x-0 top-0 z-50 flex h-10 items-center justify-between bg-background rounded-t-3xl">
+    <header className="window-drag fixed inset-x-0 top-0 z-50 flex h-10 items-center justify-between bg-background rounded-t-[0.55rem]">
       <div className="window-no-drag flex h-full">
         <Button
           type="button"
           variant="ghost"
           size="icon"
-          className="h-full rounded-none rounded-tl-3xl"
+          className="h-full rounded-none rounded-tl-[0.55rem]"
           aria-label={sidebarOpen ? 'Close sidebar' : 'Open sidebar'}
           onClick={onToggleSidebar}
         >
@@ -81,7 +81,7 @@ export function WindowTitlebar({
           type="button"
           variant="ghost"
           size="icon"
-          className="h-full rounded-none rounded-tr-3xl hover:bg-destructive hover:text-white"
+          className="h-full rounded-none rounded-tr-[0.55rem] hover:bg-destructive hover:text-white"
           aria-label="Close window"
           onClick={() => withWindow((appWindow) => appWindow.close())}
         >

@@ -3,8 +3,11 @@ import {
   ArrowDown,
   ArrowUp,
   CheckCircle2,
+  RotateCw,
   FolderOpen,
+  Gauge,
   ImagePlus,
+  RefreshCw,
   Sparkles,
   Square,
   X,
@@ -15,6 +18,9 @@ import { Card, CardContent, CardFooter } from '@/components/ui/card'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { Textarea } from '@/components/ui/textarea'
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
+import { Progress } from '@/components/ui/progress'
+import { Checkbox } from '@/components/ui/checkbox'
+import { Input } from '@/components/ui/input'
 import { useDisplayName } from '@/hooks/use-display-name'
 import { useAppStore, type ChatImage } from '../stores/app-store'
 
@@ -73,12 +79,28 @@ export function ChatPage() {
   const imageInputRef = useRef<HTMLInputElement>(null)
   const folderInputRef = useRef<HTMLInputElement>(null)
   const stickToBottom = useRef(true)
+  const forceScrollToBottom = useRef(false)
+  const previousScrollTop = useRef(0)
   const [isAtTop, setIsAtTop] = useState(true)
   const [isAtBottom, setIsAtBottom] = useState(true)
   const [attachmentError, setAttachmentError] = useState<string | null>(null)
   const displayName = useDisplayName()
   const chat = useAppStore((state) => state.chats.find((item) => item.id === state.activeChatId))
   const providers = useAppStore((state) => state.settings.providers)
+  const globallyEnabledTools = useAppStore((state) => state.settings.enabledTools)
+  const globalToolStepLimit = useAppStore((state) => state.settings.maxToolSteps)
+  const contextTurnLimit = useAppStore((state) => state.settings.contextTurnLimit)
+  const activeProvider = providers.find((provider) => provider.id === chat?.providerId)
+  const providerUsage = useAppStore((state) =>
+    chat ? state.providerUsage[chat.providerId] : undefined,
+  )
+  const providerUsageError = useAppStore((state) =>
+    chat ? state.providerUsageErrors[chat.providerId] : null,
+  )
+  const loadingProviderUsage = useAppStore((state) =>
+    chat ? state.loadingProviderUsage[chat.providerId] : false,
+  )
+  const refreshProviderUsage = useAppStore((state) => state.refreshProviderUsage)
   const setChatDraft = useAppStore((state) => state.setChatDraft)
   const setChatDraftImages = useAppStore((state) => state.setChatDraftImages)
   const setChatWorkspaceFolder = useAppStore((state) => state.setChatWorkspaceFolder)
@@ -86,12 +108,44 @@ export function ChatPage() {
   const setChatModel = useAppStore((state) => state.setChatModel)
   const setChatReasoningEffort = useAppStore((state) => state.setChatReasoningEffort)
   const sendMessage = useAppStore((state) => state.sendMessage)
+  const compactChatContext = useAppStore((state) => state.compactChatContext)
+  const [isCompacting, setIsCompacting] = useState(false)
+  const [compactionError, setCompactionError] = useState<string | null>(null)
   const steerMessage = useAppStore((state) => state.steerMessage)
   const stopGeneration = useAppStore((state) => state.stopGeneration)
+  const retryGeneration = useAppStore((state) => state.retryGeneration)
+  const updateChat = useAppStore((state) => state.updateChat)
+  const clearChatContext = useAppStore((state) => state.clearChatContext)
+  const trimChatContext = useAppStore((state) => state.trimChatContext)
+  const toolNames = [
+    'searchWeb',
+    'searchNews',
+    'searchImages',
+    'searchFiles',
+    'findFiles',
+    'findDefinition',
+    'getFileTree',
+    'inspectWorkspace',
+    'readFile',
+    'editFile',
+    'writeFile',
+    'patchFile',
+    'runCommand',
+    'git',
+    'saveMemory',
+    'manageMemories',
+  ]
   const draft = chat?.draft ?? ''
   const draftImages = chat?.draftImages ?? []
   const hasDraft = Boolean(draft.trim() || draftImages.length)
   const messages = chat?.messages ?? []
+  const contextTurns = chat?.modelMessages.filter((message) => message.role === 'user').length ?? 0
+  const estimatedTokens = Math.ceil(
+    (chat?.messages.reduce(
+      (total, message) => total + message.text.length + (message.images?.length ?? 0) * 1024,
+      0,
+    ) ?? 0) / 4,
+  )
   const isGenerating =
     chat?.generationStatus === 'queued' || chat?.generationStatus === 'generating'
   const selectedModel = `${chat?.providerId ?? ''}\u0000${chat?.modelId ?? ''}`
@@ -103,6 +157,19 @@ export function ChatPage() {
         : (chat?.reasoningEffort ?? 'medium')
   const edgeMask = `linear-gradient(to bottom, ${isAtTop ? 'black 0%' : 'transparent 0%, black 40px'}, ${isAtBottom ? 'black 100%' : 'black calc(100% - 40px), transparent 100%'})`
 
+  async function compactContext() {
+    if (!chat || isCompacting) return
+    setIsCompacting(true)
+    setCompactionError(null)
+    try {
+      await compactChatContext(chat.id)
+    } catch (error) {
+      setCompactionError(error instanceof Error ? error.message : String(error))
+    } finally {
+      setIsCompacting(false)
+    }
+  }
+
   useLayoutEffect(() => {
     const viewport = scrollAreaRef.current?.querySelector<HTMLElement>(
       '[data-slot="scroll-area-viewport"]',
@@ -111,6 +178,7 @@ export function ChatPage() {
     const saved = chatScrollPositions.get(chat.id)
     viewport.scrollTop = saved === undefined || saved === 'bottom' ? viewport.scrollHeight : saved
     stickToBottom.current = saved === undefined || saved === 'bottom'
+    previousScrollTop.current = viewport.scrollTop
   }, [chat?.id])
 
   useEffect(() => {
@@ -120,11 +188,14 @@ export function ChatPage() {
     if (!viewport) return
 
     const handleScroll = () => {
+      const scrollingDown = viewport.scrollTop > previousScrollTop.current
       setIsAtTop(viewport.scrollTop < 8)
       const atBottom = viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight < 32
-      stickToBottom.current = atBottom
+      if (scrollingDown && atBottom) stickToBottom.current = true
+      else if (!scrollingDown) stickToBottom.current = false
       setIsAtBottom(atBottom)
       if (chat?.id) chatScrollPositions.set(chat.id, atBottom ? 'bottom' : viewport.scrollTop)
+      previousScrollTop.current = viewport.scrollTop
     }
 
     viewport.addEventListener('scroll', handleScroll)
@@ -136,10 +207,13 @@ export function ChatPage() {
     const viewport = scrollAreaRef.current?.querySelector<HTMLElement>(
       '[data-slot="scroll-area-viewport"]',
     )
-    if (!viewport || !stickToBottom.current) return
+    if (!viewport || (!stickToBottom.current && !forceScrollToBottom.current)) return
+    forceScrollToBottom.current = false
 
     const frame = requestAnimationFrame(() => {
       viewport.scrollTop = viewport.scrollHeight
+      if (chat?.id) chatScrollPositions.set(chat.id, 'bottom')
+      stickToBottom.current = true
     })
     return () => cancelAnimationFrame(frame)
   }, [messages])
@@ -177,17 +251,25 @@ export function ChatPage() {
           style={{ maskImage: edgeMask, WebkitMaskImage: edgeMask }}
         >
           {messages.length ? (
-            <div className="space-y-5 p-6" aria-live="polite">
+            <div
+              className="space-y-5 p-6"
+              role="log"
+              aria-label="Conversation"
+              aria-live="polite"
+              aria-relevant="additions text"
+            >
               {chat?.tasks.length ? (
                 <details className="rounded-lg border px-3 py-2">
                   <summary className="cursor-pointer text-sm font-medium">
-                    Task list · {chat.tasks.filter((task) => task.complete).length}/
+                    Task list - {chat.tasks.filter((task) => task.complete).length}/
                     {chat.tasks.length}
                   </summary>
                   <ul className="mt-2 space-y-1.5">
                     {chat.tasks.map((task) => (
                       <li key={task.id} className="flex items-start gap-2 text-sm">
-                        <button
+                        <Button
+                          variant="ghost"
+                          size="icon-xs"
                           type="button"
                           aria-label={
                             task.complete ? `${task.text} completed` : `Complete ${task.text}`
@@ -198,7 +280,7 @@ export function ChatPage() {
                           <CheckCircle2
                             className={`mt-0.5 size-4 ${task.complete ? 'text-primary' : 'text-muted-foreground'}`}
                           />
-                        </button>
+                        </Button>
                         <span className={task.complete ? 'text-muted-foreground line-through' : ''}>
                           {task.text}
                         </span>
@@ -208,7 +290,28 @@ export function ChatPage() {
                 </details>
               ) : null}
               {messages.map((message) => (
-                <ChatMessageView key={message.id} message={message} />
+                <div key={message.id} className="space-y-1">
+                  <ChatMessageView message={message} />
+                  {message.role === 'assistant' &&
+                    message === messages.at(-1) &&
+                    (message.error || chat?.generationStatus === 'interrupted') &&
+                    !isGenerating && (
+                      message.tools.length ? (
+                        <p className="text-xs text-muted-foreground" role="status">
+                          Retry is disabled because this run used tools; repeating it could repeat their actions.
+                        </p>
+                      ) : (
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="xs"
+                          onClick={() => chat && retryGeneration(chat.id)}
+                        >
+                          <RotateCw /> Retry response
+                        </Button>
+                      )
+                    )}
+                </div>
               ))}
             </div>
           ) : (
@@ -258,7 +361,12 @@ export function ChatPage() {
           className="flex w-full flex-col gap-4"
           onSubmit={(event) => {
             event.preventDefault()
-            if (chat) sendMessage(chat.id)
+            if (chat) {
+              stickToBottom.current = true
+              forceScrollToBottom.current = true
+              chatScrollPositions.set(chat.id, 'bottom')
+              sendMessage(chat.id)
+            }
           }}
         >
           <div className="relative min-w-0">
@@ -365,6 +473,130 @@ export function ChatPage() {
                 </PopoverTrigger>
                 <PopoverContent align="end" className="space-y-4">
                   <label className="block space-y-1.5 text-xs font-medium text-muted-foreground">
+                    Chat instructions
+                    <Textarea
+                      aria-label="Chat instructions"
+                      rows={3}
+                      value={chat?.instructions ?? ''}
+                      onChange={(event) =>
+                        chat && updateChat(chat.id, { instructions: event.target.value })
+                      }
+                      placeholder="Additional instructions for this chat"
+                    />
+                  </label>
+                  <label className="flex items-center gap-2 text-xs">
+                    <Checkbox
+                      checked={chat?.useMemories ?? true}
+                      onCheckedChange={(checked) =>
+                        chat && updateChat(chat.id, { useMemories: checked === true })
+                      }
+                    />
+                    Include saved memories
+                  </label>
+                  <details>
+                    <summary className="cursor-pointer text-xs font-medium">
+                      Tools for this chat
+                    </summary>
+                    <div className="mt-2 grid grid-cols-2 gap-2">
+                      {toolNames.map((name) => (
+                        <label key={name} className="flex items-center gap-2 text-xs">
+                          <Checkbox
+                            checked={chat?.enabledTools[name] ?? true}
+                            disabled={globallyEnabledTools[name] === false}
+                            onCheckedChange={(checked) =>
+                              chat &&
+                              updateChat(chat.id, {
+                                enabledTools: {
+                                  ...chat.enabledTools,
+                                  [name]: checked === true,
+                                },
+                              })
+                            }
+                          />
+                          {name}
+                        </label>
+                      ))}
+                    </div>
+                  </details>
+                  <div className="space-y-1.5">
+                    <label
+                      htmlFor="chat-tool-step-limit"
+                      className="block text-xs font-medium text-muted-foreground"
+                    >
+                      Tool steps for this chat
+                    </label>
+                    <Input
+                      id="chat-tool-step-limit"
+                      aria-label="Tool steps for this chat"
+                      type="number"
+                      min={1}
+                      max={100}
+                      value={chat?.maxToolSteps ?? globalToolStepLimit}
+                      onChange={(event) => {
+                        if (!chat) return
+                        updateChat(chat.id, {
+                          maxToolSteps: Math.max(
+                            1,
+                            Math.min(
+                              100,
+                              Number(event.target.value) || globalToolStepLimit,
+                            ),
+                          ),
+                        })
+                      }}
+                    />
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="xs"
+                      disabled={chat?.maxToolSteps === undefined}
+                      onClick={() => chat && updateChat(chat.id, { maxToolSteps: undefined })}
+                    >
+                      Use global default ({globalToolStepLimit})
+                    </Button>
+                  </div>
+                  <div className="space-y-2 border-t pt-3">
+                    <p className="text-xs text-muted-foreground">
+                      Transcript estimate: about {estimatedTokens.toLocaleString()} tokens -{' '}
+                      {Math.min(contextTurns, contextTurnLimit)} of {contextTurnLimit} recent turns sent
+                    </p>
+                    <p className="text-xs text-muted-foreground">
+                      Estimate uses visible text and approximate image cost. The transcript stays
+                      intact when context is cleared.
+                    </p>
+                    <div className="flex min-w-0 flex-wrap gap-2">
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="xs"
+                        className="min-w-0"
+                        onClick={() => chat && trimChatContext(chat.id)}
+                      >
+                        Trim to limit
+                      </Button>
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="xs"
+                        className="min-w-0"
+                        disabled={!chat || contextTurns <= contextTurnLimit || isCompacting || isGenerating}
+                        onClick={compactContext}
+                      >
+                        {isCompacting ? 'Compacting...' : 'Compact chat'}
+                      </Button>
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="xs"
+                        className="min-w-0"
+                        onClick={() => chat && clearChatContext(chat.id)}
+                      >
+                        Clear model context
+                      </Button>
+                    </div>
+                    {compactionError && <p className="text-xs text-destructive">{compactionError}</p>}
+                  </div>
+                  <label className="block space-y-1.5 text-xs font-medium text-muted-foreground">
                     Model
                     <select
                       aria-label="Model"
@@ -444,6 +676,123 @@ export function ChatPage() {
                 </Button>
               )}
             </div>
+            <Popover
+              onOpenChange={(open) => {
+                if (
+                  open &&
+                  chat &&
+                  (activeProvider?.type === 'codex-cli' ||
+                    (activeProvider?.type === 'openrouter' && activeProvider.apiKey))
+                ) {
+                  void refreshProviderUsage(activeProvider.id)
+                }
+              }}
+            >
+              <PopoverTrigger
+                render={
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon-sm"
+                    className="absolute bottom-2 right-12"
+                    aria-label="Show provider usage"
+                    title="Provider usage"
+                  />
+                }
+              >
+                <Gauge aria-hidden="true" />
+              </PopoverTrigger>
+              <PopoverContent align="end" className="space-y-3">
+                <div className="flex items-center justify-between gap-3">
+                  <div>
+                    <p className="text-sm font-medium">
+                      {activeProvider?.name ?? 'Provider'} usage
+                    </p>
+                    <p className="text-xs text-muted-foreground">
+                      {providerUsage?.type === 'codex-cli' && providerUsage.limits.planType
+                        ? `${providerUsage.limits.planType} plan`
+                        : activeProvider?.type === 'openrouter'
+                          ? 'Account credits'
+                          : activeProvider?.type === 'codex-cli'
+                            ? 'Account rate limits'
+                            : 'Usage data is unavailable for this provider.'}
+                    </p>
+                  </div>
+                  {(activeProvider?.type === 'codex-cli' ||
+                    activeProvider?.type === 'openrouter') && (
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon-xs"
+                      aria-label="Refresh provider usage"
+                      title="Refresh usage"
+                      disabled={
+                        loadingProviderUsage ||
+                        (activeProvider.type === 'openrouter' && !activeProvider.apiKey)
+                      }
+                      onClick={() => void refreshProviderUsage(activeProvider.id)}
+                    >
+                      <RefreshCw className={loadingProviderUsage ? 'animate-spin' : ''} />
+                    </Button>
+                  )}
+                </div>
+                {providerUsageError && (
+                  <p role="alert" className="text-xs text-destructive">
+                    {providerUsageError}
+                  </p>
+                )}
+                {providerUsage?.type === 'codex-cli' && (
+                  <div className="space-y-3">
+                    {[providerUsage.limits.primary, providerUsage.limits.secondary].map(
+                      (window, index) =>
+                        window ? (
+                          <div key={index} className="space-y-1.5">
+                            <div className="flex justify-between gap-4 text-xs">
+                              <span>{index === 0 ? 'Current window' : 'Longer window'}</span>
+                              <span>{Math.max(0, 100 - window.usedPercent)}% remaining</span>
+                            </div>
+                            <Progress value={100 - window.usedPercent} />
+                            {window.resetsAt && (
+                              <p className="text-xs text-muted-foreground">
+                                Resets {new Date(window.resetsAt * 1000).toLocaleString()}
+                              </p>
+                            )}
+                          </div>
+                        ) : null,
+                    )}
+                    {!providerUsage.limits.primary && !providerUsage.limits.secondary && (
+                      <p className="text-xs text-muted-foreground">No rate limits were reported.</p>
+                    )}
+                  </div>
+                )}
+                {providerUsage?.type === 'openrouter' && (
+                  <div className="space-y-1.5">
+                    <p className="text-sm">
+                      ${(providerUsage.totalCredits - providerUsage.totalUsage).toFixed(2)}{' '}
+                      remaining
+                    </p>
+                    <Progress
+                      value={
+                        providerUsage.totalCredits > 0
+                          ? ((providerUsage.totalCredits - providerUsage.totalUsage) /
+                              providerUsage.totalCredits) *
+                            100
+                          : 0
+                      }
+                    />
+                    <p className="text-xs text-muted-foreground">
+                      ${providerUsage.totalUsage.toFixed(2)} used of $
+                      {providerUsage.totalCredits.toFixed(2)}
+                    </p>
+                  </div>
+                )}
+                {activeProvider?.type === 'openrouter' && !activeProvider.apiKey && (
+                  <p className="text-xs text-muted-foreground">
+                    Set a management key in provider settings to view credits.
+                  </p>
+                )}
+              </PopoverContent>
+            </Popover>
             <div className="absolute bottom-2 right-2 flex gap-1">
               {isGenerating && chat?.generationStatus === 'generating' && hasDraft && (
                 <Button

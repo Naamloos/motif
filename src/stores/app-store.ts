@@ -1,3 +1,4 @@
+import os from 'node:os'
 import type { ModelMessage, Tool } from 'ai'
 import { create } from 'zustand'
 import AiService from '@/services/ai-service'
@@ -14,8 +15,8 @@ import {
   saveSettingsData,
 } from '@/services/app-data-service'
 import getModelName from '../tools/get-model-name'
-import searchWikipedia from '../tools/search-wikipedia'
-import { searchWeb } from '../tools/search-web'
+import { searchWikipedia } from '@/tools/search-wikipedia'
+import { searchImages, searchNews, searchWeb } from '@/tools/search-web'
 import { createAgentTools } from '@/services/agent-tools'
 import { useToolPromptStore } from '@/stores/tool-prompt-store'
 import {
@@ -24,6 +25,8 @@ import {
   type McpServerConfig,
 } from '@/services/mcp-service'
 import type { AgentToolContext } from '@/services/agent-tool-context'
+import { readCodexUsageLimits, type CodexUsageLimits } from '@/services/codex-usage-service'
+import { getCurrentDisplayName } from '@/hooks/use-display-name'
 import {
   defaultSettings,
   makeChat,
@@ -34,6 +37,7 @@ import {
   type ChatImage,
   type ChatMessage,
   type Settings,
+  type RunSettingsSnapshot,
 } from '@/stores/app-model'
 
 export type {
@@ -48,11 +52,16 @@ export type {
 
 const aiService = new AiService()
 const controllers = new Map<string, AbortController>()
+const pendingRunSnapshots = new Map<string, { chat: Chat; settings: Settings }>()
 let generationQueue: string[] = []
 let initializing = false
 
-function formatValue(value: unknown) {
+function formatValue(value: unknown): string {
   if (typeof value === 'string') return value
+  if (value instanceof Error) {
+    const cause: string = 'cause' in value && value.cause ? `\nCaused by: ${formatValue(value.cause)}` : ''
+    return `${value.name}: ${value.message || 'Unknown error'}${cause}`
+  }
   if (value && typeof value === 'object' && 'image' in value && typeof value.image === 'string')
     return '[image]'
   try {
@@ -94,6 +103,104 @@ function updateAssistant(
   }))
 }
 
+function makeRunSnapshot(chat: Chat, settings: Settings): RunSettingsSnapshot {
+  const provider = settings.providers.find((item) => item.id === chat.providerId)
+  const enabledTools = Object.keys(settings.enabledTools).filter(
+    (name) => settings.enabledTools[name] !== false && chat.enabledTools[name] !== false,
+  )
+  for (const server of settings.mcpServers) {
+    if (!server.enabled) continue
+    for (const name of server.availableTools ?? []) {
+      if (!server.disabledTools?.includes(name)) enabledTools.push(`${server.name}.${name}`)
+    }
+  }
+  return {
+    provider: provider?.name ?? 'Unknown provider',
+    model: chat.modelId,
+    reasoningEffort: chat.reasoningEffort,
+    maxToolSteps: chat.maxToolSteps ?? settings.maxToolSteps,
+    enabledTools,
+    contextTurns: settings.contextTurnLimit,
+    systemPrompt: createSystemPrompt(settings, chat),
+    memories: chat.useMemories ? [...settings.memories] : [],
+    workspaceFolder: chat.workspaceFolder,
+    approvalForFileChanges: settings.requireApprovalForFileChanges,
+    approvalForMcpTools: settings.requireApprovalForMcpTools,
+    approvalForCommands: settings.requireApprovalForCommands,
+    approvalForBrowser: settings.requireApprovalForBrowser,
+  }
+}
+
+function queueRunSnapshot(chatId: string) {
+  const state = useAppStore.getState()
+  const chat = state.chats.find((item) => item.id === chatId)
+  if (chat) {
+    pendingRunSnapshots.set(chatId, {
+      // Settings and chat records use immutable Zustand updates, so shallow copies freeze the
+      // selected records without duplicating potentially large image and transcript payloads.
+      chat: {
+        ...chat,
+        messages: [...chat.messages],
+        modelMessages: [...chat.modelMessages],
+        tasks: [...chat.tasks],
+      },
+      settings: {
+        ...state.settings,
+        providers: [...state.settings.providers],
+        enabledTools: { ...state.settings.enabledTools },
+        mcpServers: [...state.settings.mcpServers],
+        memories: [...state.settings.memories],
+      },
+    })
+  }
+}
+
+function limitModelContext(messages: ModelMessage[], turnLimit: number) {
+  const userTurns: number[] = []
+  for (let index = messages.length - 1; index >= 0 && userTurns.length < turnLimit; index -= 1) {
+    if (messages[index].role === 'user') userTurns.push(index)
+  }
+  return messages.slice(userTurns.at(-1) ?? 0)
+}
+
+async function compactMessages(
+  chat: Chat,
+  messages: ModelMessage[],
+  settings: Settings,
+  turnLimit = settings.contextTurnLimit,
+  abortSignal?: AbortSignal,
+) {
+  const userTurns: number[] = []
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    if (messages[index].role === 'user') userTurns.push(index)
+  }
+  if (userTurns.length <= turnLimit) return messages
+  const keepFrom = userTurns[turnLimit - 1]
+  if (keepFrom <= 0) return messages
+  const provider = settings.providers.find((item) => item.id === chat.providerId)
+  if (!provider) throw new Error('The selected provider is no longer configured')
+  const generation = aiService.generate({
+    provider,
+    modelId: chat.modelId,
+    cwd: chat.workspaceFolder,
+    reasoningEffort: 'none',
+    maxToolSteps: 1,
+    system: 'Summarize the conversation so far for future use. Preserve the user’s goals, decisions, preferences, important facts, and unresolved work. Be concise. Return only the summary.',
+    chat: messages.slice(0, keepFrom),
+    tools: {},
+    abortSignal,
+  })
+  let summary = ''
+  try {
+    for await (const part of generation.result.textStream) summary += part
+  } finally {
+    await generation.close()
+  }
+  return summary.trim()
+    ? [{ role: 'system' as const, content: `Earlier conversation summary:\n${summary.trim()}` }, ...messages.slice(keepFrom)]
+    : messages
+}
+
 function closeReasoning(activity: AssistantActivity[], now = Date.now()) {
   const next = [...activity]
   const last = next.at(-1)
@@ -103,10 +210,16 @@ function closeReasoning(activity: AssistantActivity[], now = Date.now()) {
   return next
 }
 
-function createGenerationTools(chat: Chat, settings: Settings, mcpTools: Record<string, Tool>) {
+function createGenerationTools(
+  chat: Chat,
+  settings: Settings,
+  mcpTools: Record<string, Tool>,
+  abortSignal: AbortSignal,
+) {
   const chatId = chat.id
   const context: AgentToolContext = {
     chatId,
+    abortSignal,
     folder: chat.workspaceFolder,
     images: [...chat.messages]
       .reverse()
@@ -116,40 +229,147 @@ function createGenerationTools(chat: Chat, settings: Settings, mcpTools: Record<
     requestApproval: (title, description) => {
       const chatTitle =
         useAppStore.getState().chats.find((item) => item.id === chatId)?.title ?? 'Chat'
-      return useToolPromptStore.getState().askApproval(`${title} · ${chatTitle}`, description)
+      return useToolPromptStore
+        .getState()
+        .askApproval(`${title} - ${chatTitle}`, description)
+        .then((approved) => {
+          const current = useAppStore.getState()
+          current.updateSettings({
+            toolAudit: [
+              ...current.settings.toolAudit.slice(-499),
+              {
+                id: crypto.randomUUID(),
+                at: Date.now(),
+                chatTitle,
+                action: title,
+                details:
+                  description.length <= 4_000
+                    ? description
+                    : `${description.slice(0, 4_000)}...`,
+                approved,
+              },
+            ],
+          })
+          return approved
+        })
     },
     askUser: (question) => {
       const chatTitle =
         useAppStore.getState().chats.find((item) => item.id === chatId)?.title ?? 'Chat'
-      return useToolPromptStore.getState().askQuestion(`Question · ${chatTitle}`, question)
+      return useToolPromptStore.getState().askQuestion(`Question - ${chatTitle}`, question)
     },
     addTask: (id, text) => useAppStore.getState().addChatTask(id, text),
     completeTask: (id, taskId) => useAppStore.getState().completeChatTask(id, taskId),
     saveMemory: (memory) => {
       const current = useAppStore.getState()
-      current.updateSettings({ memories: [...current.settings.memories, memory] })
+      if (!current.settings.memories.includes(memory))
+        current.updateSettings({ memories: [...current.settings.memories, memory] })
     },
+    listMemories: () => useAppStore.getState().settings.memories,
+    removeMemory: (memory) => {
+      const current = useAppStore.getState()
+      if (!current.settings.memories.includes(memory)) return false
+      current.updateSettings({
+        memories: current.settings.memories.filter((item) => item !== memory),
+      })
+      return true
+    },
+    updateMemory: (memory, replacement) => {
+      const current = useAppStore.getState()
+      if (!current.settings.memories.includes(memory)) return false
+      current.updateSettings({
+        memories: current.settings.memories.map((item) =>
+          item === memory ? replacement : item,
+        ),
+      })
+      return true
+    },
+    requireApprovalForFileChanges: settings.requireApprovalForFileChanges,
+    requireApprovalForMcpTools: settings.requireApprovalForMcpTools,
+    requireApprovalForCommands: settings.requireApprovalForCommands,
+    requireApprovalForBrowser: settings.requireApprovalForBrowser,
   }
 
   const enabledAgentTools = Object.fromEntries(
     Object.entries(createAgentTools(context)).filter(
-      ([name]) => settings.enabledTools[name] !== false,
+      ([name]) => settings.enabledTools[name] !== false && chat.enabledTools[name] !== false,
     ),
   )
 
+  const guardedMcpTools = Object.fromEntries(
+    Object.entries(mcpTools).map(([name, mcpTool]) => [
+      name,
+      {
+        ...mcpTool,
+        execute: async (input: unknown, options: unknown) => {
+          if (
+            context.requireApprovalForMcpTools &&
+            !(await context.requestApproval(`Use MCP tool: ${name}`, formatValue(input)))
+          ) {
+            return 'The user denied this MCP tool request.'
+          }
+          if (!mcpTool.execute) throw new Error(`MCP tool ${name} cannot be executed.`)
+          return mcpTool.execute(input as never, options as never)
+        },
+      } as Tool,
+    ]),
+  )
+
   return {
-    ...mcpTools,
-    ...(settings.enabledTools.getModelName ? { getModelName: getModelName(chat.modelId) } : {}),
-    ...(settings.enabledTools.searchWikipedia ? { searchWikipedia } : {}),
-    ...(settings.enabledTools.searchWeb ? { searchWeb: searchWeb(settings.searxngUrl) } : {}),
+    ...guardedMcpTools,
+    ...(settings.enabledTools.getModelName !== false && chat.enabledTools.getModelName !== false
+      ? { getModelName: getModelName(chat.modelId) }
+      : {}),
+    ...(settings.enabledTools.searchWikipedia !== false &&
+    chat.enabledTools.searchWikipedia !== false
+      ? { searchWikipedia: searchWikipedia(abortSignal) }
+      : {}),
+    ...(settings.enabledTools.searchWeb !== false && chat.enabledTools.searchWeb !== false
+      ? { searchWeb: searchWeb(settings.searxngUrl, abortSignal) }
+      : {}),
+    ...(settings.enabledTools.searchNews !== false && chat.enabledTools.searchNews !== false
+      ? { searchNews: searchNews(settings.searxngUrl, abortSignal) }
+      : {}),
+    ...(settings.enabledTools.searchImages !== false && chat.enabledTools.searchImages !== false
+      ? { searchImages: searchImages(settings.searxngUrl, abortSignal) }
+      : {}),
     ...enabledAgentTools,
   }
 }
 
-function createSystemPrompt(settings: Settings) {
-  if (!settings.memories.length) return settings.systemPrompt
-  const memories = settings.memories.map((memory) => `- ${memory}`).join('\n')
-  return `${settings.systemPrompt}\n\nUser-approved memories:\n${memories}`
+function createSystemPrompt(settings: Settings, chat: Chat) {
+  const displayName = getCurrentDisplayName()
+  const instructions = [settings.systemPrompt, chat.instructions].filter(Boolean).join('\n\n')
+  const now = new Date()
+  const runtimeContext = [
+    'Runtime context (use when relevant; do not repeat unless useful):',
+    `Current user: ${displayName}`,
+    `Current local date and time: ${new Intl.DateTimeFormat(undefined, {
+      dateStyle: 'full',
+      timeStyle: 'long',
+    }).format(now)}`,
+    `Time zone: ${Intl.DateTimeFormat().resolvedOptions().timeZone}`,
+    `Operating system: ${os.type()} ${os.release()} (${os.arch()})`,
+    `Hostname: ${os.hostname()}`,
+    `Conversation: ${chat.title}`,
+    `Workspace folder: ${chat.workspaceFolder || 'not selected'}`,
+  ]
+  const enabledTools = Object.keys(settings.enabledTools).filter(
+    (name) => settings.enabledTools[name] !== false && chat.enabledTools[name] !== false,
+  )
+  for (const server of settings.mcpServers) {
+    if (!server.enabled) continue
+    for (const name of server.availableTools ?? []) {
+      if (!server.disabledTools?.includes(name)) enabledTools.push(`${server.name}.${name}`)
+    }
+  }
+  runtimeContext.push(`Enabled tools: ${enabledTools.length ? enabledTools.join(', ') : 'none'}`)
+
+  const sections = [instructions, runtimeContext.join('\n')]
+  if (chat.useMemories && settings.memories.length) {
+    sections.push(`User-approved memories:\n${settings.memories.map((memory) => `- ${memory}`).join('\n')}`)
+  }
+  return sections.filter(Boolean).join('\n\n')
 }
 
 function pumpGenerationQueue() {
@@ -163,15 +383,21 @@ function pumpGenerationQueue() {
 
     const controller = new AbortController()
     controllers.set(chatId, controller)
-    void runGeneration(chatId, controller).finally(() => {
+    const snapshot = pendingRunSnapshots.get(chatId)
+    pendingRunSnapshots.delete(chatId)
+    void runGeneration(chatId, controller, snapshot).finally(() => {
       controllers.delete(chatId)
       pumpGenerationQueue()
     })
   }
 }
 
-async function runGeneration(chatId: string, controller: AbortController) {
-  const chat = useAppStore.getState().chats.find((item) => item.id === chatId)
+async function runGeneration(
+  chatId: string,
+  controller: AbortController,
+  snapshot?: { chat: Chat; settings: Settings },
+) {
+  const chat = snapshot?.chat ?? useAppStore.getState().chats.find((item) => item.id === chatId)
   const assistantMessage = chat?.messages.at(-1)
   const userMessage = chat?.messages.at(-2)
 
@@ -195,13 +421,50 @@ async function runGeneration(chatId: string, controller: AbortController) {
   let generationStartedAt: number | undefined
   let releaseProviderModel: () => void = () => {}
   let closeMcp = async () => {}
+  let closeProvider = async () => {}
 
   try {
-    const provider = useAppStore
-      .getState()
-      .settings.providers.find((item) => item.id === chat.providerId)
+    const settings = snapshot?.settings ?? useAppStore.getState().settings
+    const provider = settings.providers.find((item) => item.id === chat.providerId)
     if (!provider) throw new Error('The selected provider is no longer configured')
-    const settings = useAppStore.getState().settings
+    if (chat.title === 'New chat' && userMessage.text.trim()) {
+      const titleGeneration = aiService.generate({
+        provider,
+        modelId: chat.modelId,
+        cwd: chat.workspaceFolder,
+        reasoningEffort: 'none',
+        maxToolSteps: 1,
+        system: 'Generate a concise title for the conversation from the user’s first message. Return only the title, with no quotation marks or explanation. Keep it under 8 words.',
+        chat: [{ role: 'user', content: userMessage.text }],
+        tools: {},
+        abortSignal: controller.signal,
+      })
+      let title = ''
+      try {
+        for await (const part of titleGeneration.result.textStream) title += part
+      } finally {
+        await titleGeneration.close()
+      }
+      const generatedTitle = title.trim().replace(/^['"“”]+|['"“”]+$/g, '').slice(0, 64)
+      if (generatedTitle) {
+        updateChat(chatId, (current) => ({
+          ...current,
+          title: current.title === 'New chat' ? generatedTitle : current.title,
+        }))
+      }
+    }
+    if (controller.signal.aborted) throw controller.signal.reason
+    const compactedContext = await compactMessages(
+      chat,
+      chat.modelMessages,
+      settings,
+      Math.max(1, settings.contextTurnLimit - 1),
+      controller.signal,
+    )
+    if (compactedContext !== chat.modelMessages) {
+      updateChat(chatId, (current) => ({ ...current, modelMessages: compactedContext }))
+    }
+    if (controller.signal.aborted) throw controller.signal.reason
     releaseProviderModel = await aiService.prepareModel(
       provider,
       chat.modelId,
@@ -223,25 +486,38 @@ async function runGeneration(chatId: string, controller: AbortController) {
     closeMcp = mcpSession.close
     if (controller.signal.aborted) throw controller.signal.reason
     generationStartedAt = Date.now()
-    const result = aiService.generate({
+    const generation = aiService.generate({
       provider,
       modelId: chat.modelId,
+      cwd: chat.workspaceFolder,
       reasoningEffort: chat.reasoningEffort,
-      system: createSystemPrompt(settings),
-      chat: [...chat.modelMessages, modelUserMessage],
-      tools: createGenerationTools(chat, settings, mcpSession.tools),
+      maxToolSteps: chat.maxToolSteps ?? settings.maxToolSteps,
+      system: createSystemPrompt(settings, chat),
+      chat: [...compactedContext, modelUserMessage],
+      tools: createGenerationTools(chat, settings, mcpSession.tools, controller.signal),
       abortSignal: controller.signal,
     })
+    const result = generation.result
+    closeProvider = generation.close
 
     for await (const part of result.stream) {
       switch (part.type) {
         case 'text-delta':
-          updateAssistant(chatId, assistantMessage.id, (message) => ({
-            ...message,
-            activity: closeReasoning(message.activity),
-            activeActivityId: null,
-            text: message.text + part.text,
-          }))
+          updateAssistant(chatId, assistantMessage.id, (message) => {
+            const activity = closeReasoning(message.activity)
+            const last = activity.at(-1)
+            if (last?.type === 'text') {
+              activity[activity.length - 1] = { ...last, text: last.text + part.text }
+            } else {
+              activity.push({ id: crypto.randomUUID(), type: 'text', text: part.text })
+            }
+            return {
+              ...message,
+              activity,
+              activeActivityId: null,
+              text: message.text + part.text,
+            }
+          })
           break
         case 'reasoning-delta':
           updateAssistant(chatId, assistantMessage.id, (message) => {
@@ -387,7 +663,7 @@ async function runGeneration(chatId: string, controller: AbortController) {
       }))
     }
   } finally {
-    await closeMcp()
+    await Promise.allSettled([closeProvider(), closeMcp()])
     releaseProviderModel()
     updateAssistant(chatId, assistantMessage.id, (message) => ({
       ...message,
@@ -420,6 +696,7 @@ async function runGeneration(chatId: string, controller: AbortController) {
         tools: [],
         activity: [],
         isStreaming: true,
+        runSnapshot: makeRunSnapshot(current, useAppStore.getState().settings),
       }
       // Steering aborts the current stream, retains visible text, then resumes with the new user message.
       generationQueue.push(chatId)
@@ -431,6 +708,9 @@ async function runGeneration(chatId: string, controller: AbortController) {
         generationStatus: 'queued',
       }
     })
+    if (useAppStore.getState().chats.find((item) => item.id === chatId)?.generationStatus === 'queued') {
+      queueRunSnapshot(chatId)
+    }
   }
 }
 
@@ -441,6 +721,9 @@ type AppState = {
   isHydrated: boolean
   modelRefreshStatus: 'idle' | 'loading' | 'success' | 'error'
   modelRefreshError: string | null
+  providerUsage: Record<string, ProviderUsage | undefined>
+  providerUsageErrors: Record<string, string | null | undefined>
+  loadingProviderUsage: Record<string, boolean | undefined>
   persistenceError: string | null
   loadedModels: Record<string, LoadedModel[]>
   loadedModelErrors: Record<string, string | null>
@@ -449,9 +732,19 @@ type AppState = {
   checkMcpServer: (id: string) => Promise<void>
   initialize: () => Promise<void>
   createChat: () => string
+  duplicateChat: (chatId: string) => string | null
   selectChat: (chatId: string) => void
   renameChat: (chatId: string, title: string) => void
+  updateChat: (
+    chatId: string,
+    updates: Partial<
+      Pick<Chat, 'instructions' | 'enabledTools' | 'useMemories' | 'pinned' | 'archived' | 'maxToolSteps'>
+    >,
+  ) => void
   deleteChat: (chatId: string) => void
+  clearChatContext: (chatId: string) => void
+  trimChatContext: (chatId: string) => void
+  compactChatContext: (chatId: string) => Promise<void>
   setChatDraft: (chatId: string, draft: string) => void
   setChatDraftImages: (chatId: string, images: ChatImage[]) => void
   setChatWorkspaceFolder: (chatId: string, folder: string | undefined) => void
@@ -462,10 +755,12 @@ type AppState = {
   sendMessage: (chatId: string) => void
   steerMessage: (chatId: string) => void
   stopGeneration: (chatId: string) => void
+  retryGeneration: (chatId: string) => void
   setMaxConcurrentGenerations: (count: number) => void
   saveProviderBaseURL: (providerId: string, baseURL: string) => boolean
   updateProvider: (providerId: string, updates: Partial<ProviderConfig>) => void
   refreshModels: (providerId: string) => Promise<void>
+  refreshProviderUsage: (providerId: string) => Promise<void>
   refreshLoadedModels: (providerId: string) => Promise<void>
   unloadLoadedModel: (providerId: string, model: LoadedModel) => Promise<void>
   setDefaultModel: (providerId: string, modelId: string) => void
@@ -474,12 +769,19 @@ type AppState = {
       Pick<
         Settings,
         | 'theme'
+        | 'maxToolSteps'
+        | 'contextTurnLimit'
+        | 'requireApprovalForFileChanges'
+        | 'requireApprovalForMcpTools'
+        | 'requireApprovalForCommands'
+        | 'requireApprovalForBrowser'
         | 'primaryColor'
         | 'systemPrompt'
         | 'enabledTools'
         | 'defaultProviderId'
         | 'unloadOtherModelsOnSwitch'
         | 'memories'
+        | 'toolAudit'
         | 'searxngUrl'
         | 'mcpServers'
       >
@@ -489,6 +791,10 @@ type AppState = {
   removeProvider: (providerId: string) => void
 }
 
+type ProviderUsage =
+  | { type: 'codex-cli'; limits: CodexUsageLimits }
+  | { type: 'openrouter'; totalCredits: number; totalUsage: number }
+
 export const useAppStore = create<AppState>((set) => ({
   settings: defaultSettings,
   chats: [],
@@ -496,6 +802,9 @@ export const useAppStore = create<AppState>((set) => ({
   isHydrated: false,
   modelRefreshStatus: 'idle',
   modelRefreshError: null,
+  providerUsage: {},
+  providerUsageErrors: {},
+  loadingProviderUsage: {},
   persistenceError: null,
   loadedModels: {},
   loadedModelErrors: {},
@@ -590,6 +899,55 @@ export const useAppStore = create<AppState>((set) => ({
     return chat.id
   },
 
+  duplicateChat: (chatId) => {
+    const source = useAppStore.getState().chats.find((chat) => chat.id === chatId)
+    if (!source) return null
+
+    const messageIds = new Map(
+      source.messages.map((message) => [message.id, crypto.randomUUID()] as const),
+    )
+    const toolIds = new Map(
+      source.messages.flatMap((message) =>
+        message.tools.map((tool) => [tool.id, crypto.randomUUID()] as const),
+      ),
+    )
+  const duplicate: Chat = {
+      ...source,
+      id: crypto.randomUUID(),
+      title: `${source.title} copy`,
+      draft: '',
+      draftImages: [],
+      tasks: source.tasks.map((task) => ({ ...task, id: crypto.randomUUID() })),
+      messages: source.messages.map((message) => ({
+        ...message,
+        id: messageIds.get(message.id)!,
+        images: message.images?.map((image) => ({ ...image, id: crypto.randomUUID() })),
+        tools: message.tools.map((tool) => ({ ...tool, id: toolIds.get(tool.id)! })),
+        activity: message.activity.map((activity) => {
+          if (activity.type === 'tool') {
+            return {
+              ...activity,
+              id: crypto.randomUUID(),
+              toolId: toolIds.get(activity.toolId) ?? activity.toolId,
+            }
+          }
+          return { ...activity, id: crypto.randomUUID() }
+        }),
+        isStreaming: false,
+        activeActivityId: null,
+      })),
+      generationStatus: 'idle',
+      steeringMessageId: null,
+      archived: false,
+      updatedAt: Date.now(),
+    }
+    useAppStore.setState((state) => ({
+      chats: [duplicate, ...state.chats],
+      activeChatId: duplicate.id,
+    }))
+    return duplicate.id
+  },
+
   selectChat: (chatId) => set({ activeChatId: chatId }),
 
   renameChat: (chatId, title) => {
@@ -597,9 +955,11 @@ export const useAppStore = create<AppState>((set) => ({
     if (!nextTitle) return
     updateChat(chatId, (chat) => ({ ...chat, title: nextTitle, updatedAt: Date.now() }))
   },
+  updateChat: (chatId, updates) => updateChat(chatId, (chat) => ({ ...chat, ...updates })),
 
   deleteChat: (chatId) => {
     generationQueue = generationQueue.filter((id) => id !== chatId)
+    pendingRunSnapshots.delete(chatId)
     controllers.get(chatId)?.abort()
     useAppStore.setState((state) => {
       const chats = state.chats.filter((chat) => chat.id !== chatId)
@@ -610,6 +970,38 @@ export const useAppStore = create<AppState>((set) => ({
       }
     })
     pumpGenerationQueue()
+  },
+
+  clearChatContext: (chatId) =>
+    updateChat(chatId, (chat) => ({ ...chat, modelMessages: [] })),
+
+  trimChatContext: (chatId) => {
+    const limit = useAppStore.getState().settings.contextTurnLimit
+    updateChat(chatId, (chat) => ({
+      ...chat,
+      modelMessages: limitModelContext(chat.modelMessages, limit),
+    }))
+  },
+
+  compactChatContext: async (chatId) => {
+    const state = useAppStore.getState()
+    const chat = state.chats.find((item) => item.id === chatId)
+    if (!chat || chat.generationStatus !== 'idle') return
+    const settings = state.settings
+    const messages = chat.modelMessages
+    const userTurns = messages.filter((message) => message.role === 'user').length
+    if (userTurns <= settings.contextTurnLimit) return
+    const controller = new AbortController()
+    const compacted = await compactMessages(
+      chat,
+      messages,
+      settings,
+      settings.contextTurnLimit,
+      controller.signal,
+    )
+    updateChat(chatId, (current) =>
+      current.modelMessages === messages ? { ...current, modelMessages: compacted } : current,
+    )
   },
 
   setChatDraft: (chatId, draft) => updateChat(chatId, (chat) => ({ ...chat, draft })),
@@ -681,17 +1073,19 @@ export const useAppStore = create<AppState>((set) => ({
       tools: [],
       activity: [],
       isStreaming: true,
+      runSnapshot: makeRunSnapshot(chat, useAppStore.getState().settings),
     }
 
     updateChat(chatId, (current) => ({
       ...current,
-      title: current.title === 'New chat' ? (text || images[0].name).slice(0, 48) : current.title,
+      title: current.title,
       draft: '',
       draftImages: [],
       messages: [...current.messages, userMessage, assistantMessage],
       generationStatus: 'queued',
       updatedAt: Date.now(),
     }))
+    queueRunSnapshot(chatId)
     generationQueue.push(chatId)
     pumpGenerationQueue()
   },
@@ -732,6 +1126,7 @@ export const useAppStore = create<AppState>((set) => ({
     if (!chat || !['queued', 'generating'].includes(chat.generationStatus)) return
     if (chat.generationStatus === 'queued') {
       generationQueue = generationQueue.filter((id) => id !== chatId)
+      pendingRunSnapshots.delete(chatId)
       const assistant = chat.messages.at(-1)
       updateChat(chatId, (current) => ({
         ...current,
@@ -745,6 +1140,35 @@ export const useAppStore = create<AppState>((set) => ({
       updateChat(chatId, (current) => ({ ...current, steeringMessageId: null }))
       controllers.get(chatId)?.abort('stop')
     }
+  },
+
+  retryGeneration: (chatId) => {
+    const chat = useAppStore.getState().chats.find((item) => item.id === chatId)
+    if (!chat || !['idle', 'interrupted'].includes(chat.generationStatus)) return
+    const lastAssistant = chat.messages.at(-1)
+    const lastUser = chat.messages.at(-2)
+    if (lastAssistant?.role !== 'assistant' || lastUser?.role !== 'user') return
+    // Replaying tool calls can repeat file writes or other external actions.
+    if (lastAssistant.tools.length) return
+    // Keep the user message and replace the failed partial response before retrying.
+    const assistant: ChatMessage = {
+      id: crypto.randomUUID(),
+      role: 'assistant',
+      text: '',
+      reasoning: '',
+      tools: [],
+      activity: [],
+      isStreaming: true,
+      runSnapshot: makeRunSnapshot(chat, useAppStore.getState().settings),
+    }
+    updateChat(chatId, (current) => ({
+      ...current,
+      messages: [...current.messages.slice(0, -1), assistant],
+      generationStatus: 'queued',
+    }))
+    queueRunSnapshot(chatId)
+    generationQueue.push(chatId)
+    pumpGenerationQueue()
   },
 
   setMaxConcurrentGenerations: (count) => {
@@ -837,6 +1261,32 @@ export const useAppStore = create<AppState>((set) => ({
     }
   },
 
+  refreshProviderUsage: async (providerId) => {
+    const provider = useAppStore
+      .getState()
+      .settings.providers.find((item) => item.id === providerId)
+    if (!provider || !['codex-cli', 'openrouter'].includes(provider.type)) return
+    set((state) => ({
+      loadingProviderUsage: { ...state.loadingProviderUsage, [providerId]: true },
+      providerUsageErrors: { ...state.providerUsageErrors, [providerId]: null },
+    }))
+    try {
+      const usage =
+        provider.type === 'codex-cli'
+          ? { type: 'codex-cli' as const, limits: await readCodexUsageLimits() }
+          : await readOpenRouterCredits(provider.apiKey)
+      set((state) => ({
+        providerUsage: { ...state.providerUsage, [providerId]: usage },
+        loadingProviderUsage: { ...state.loadingProviderUsage, [providerId]: false },
+      }))
+    } catch (error) {
+      set((state) => ({
+        providerUsageErrors: { ...state.providerUsageErrors, [providerId]: formatValue(error) },
+        loadingProviderUsage: { ...state.loadingProviderUsage, [providerId]: false },
+      }))
+    }
+  },
+
   refreshLoadedModels: async (providerId) => {
     const provider = useAppStore
       .getState()
@@ -913,6 +1363,7 @@ export const useAppStore = create<AppState>((set) => ({
       anthropic: { baseURL: 'https://api.anthropic.com/v1', kind: 'anthropic' },
       openrouter: { baseURL: 'https://openrouter.ai/api/v1', kind: 'openai-compatible' },
       google: { baseURL: '', kind: 'google' },
+      'codex-cli': { baseURL: '', kind: 'openai' },
     }
     const provider: ProviderConfig = {
       id: crypto.randomUUID(),
@@ -975,12 +1426,40 @@ function rememberMcpTools(server: McpServerConfig, tools: string[]) {
   })
 }
 
+async function readOpenRouterCredits(apiKey?: string): Promise<ProviderUsage> {
+  if (!apiKey) throw new Error('Add an OpenRouter management key to view credits.')
+  const response = await fetch('https://openrouter.ai/api/v1/credits', {
+    headers: { Authorization: `Bearer ${apiKey}` },
+  })
+  if (!response.ok) throw new Error(`OpenRouter credits returned ${response.status}`)
+  const result: unknown = await response.json()
+  if (
+    !result ||
+    typeof result !== 'object' ||
+    !('data' in result) ||
+    !result.data ||
+    typeof result.data !== 'object' ||
+    !('total_credits' in result.data) ||
+    typeof result.data.total_credits !== 'number' ||
+    !('total_usage' in result.data) ||
+    typeof result.data.total_usage !== 'number'
+  ) {
+    throw new Error('OpenRouter returned invalid credit data')
+  }
+  return {
+    type: 'openrouter',
+    totalCredits: result.data.total_credits,
+    totalUsage: result.data.total_usage,
+  }
+}
+
 let persistTimer: ReturnType<typeof setTimeout> | undefined
 let writeQueue = Promise.resolve()
 
 function persistCurrentState() {
-  if (persistTimer) clearTimeout(persistTimer)
+  if (persistTimer) return
   persistTimer = setTimeout(() => {
+    persistTimer = undefined
     const { settings, chats, activeChatId } = useAppStore.getState()
     const data = { version: 1, settings, chats, activeChatId }
     writeQueue = writeQueue
@@ -993,7 +1472,7 @@ function persistCurrentState() {
       .catch((error: unknown) =>
         useAppStore.setState({ persistenceError: `Could not save data: ${formatValue(error)}` }),
       )
-  }, 300)
+  }, 750)
 }
 
 useAppStore.subscribe((state, previous) => {

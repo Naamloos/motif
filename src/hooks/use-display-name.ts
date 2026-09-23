@@ -6,6 +6,7 @@ import { promisify } from 'node:util'
 const execFileAsync = promisify(execFile)
 
 const username = os.userInfo().username
+let currentDisplayName = username
 
 let displayNamePromise: Promise<string> | undefined
 
@@ -51,10 +52,17 @@ async function resolveDisplayName(): Promise<string> {
   }
 }
 
-function getDisplayName(): Promise<string> {
-  displayNamePromise ??= resolveDisplayName()
+export function getDisplayName(): Promise<string> {
+  displayNamePromise ??= resolveDisplayName().then((name) => {
+    currentDisplayName = name
+    return name
+  })
 
   return displayNamePromise
+}
+
+export function getCurrentDisplayName(): string {
+  return currentDisplayName
 }
 
 export function useDisplayName(): string {

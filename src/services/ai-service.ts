@@ -2,6 +2,8 @@ import { createOpenAICompatible } from '@ai-sdk/openai-compatible'
 import { createOpenAI } from '@ai-sdk/openai'
 import { createAnthropic } from '@ai-sdk/anthropic'
 import { createOllama } from 'ai-sdk-ollama'
+import { createCodexAppServer, createSdkMcpServer } from 'ai-sdk-provider-codex-cli'
+import { z } from 'zod'
 import {
   isStepCount,
   streamText,
@@ -12,7 +14,8 @@ import {
 } from 'ai'
 
 export type ProviderKind = 'openai-compatible' | 'openai' | 'anthropic' | 'google'
-export type ProviderType = 'lmstudio' | 'ollama' | 'openai' | 'anthropic' | 'openrouter' | 'google'
+export type ProviderType =
+  'lmstudio' | 'ollama' | 'openai' | 'anthropic' | 'openrouter' | 'google' | 'codex-cli'
 export type ReasoningEffort =
   'provider-default' | 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh'
 
@@ -45,7 +48,9 @@ export interface AiServiceOptions {
   tools: { [key: string]: Tool }
   provider: ProviderConfig
   modelId: string
+  cwd?: string
   reasoningEffort: ReasoningEffort
+  maxToolSteps: number
   abortSignal?: AbortSignal
 }
 
@@ -61,17 +66,52 @@ export default class AiService {
   private modelLeases = new Map<string, ModelContextLease>()
 
   generate(options: AiServiceOptions) {
+    if (options.provider.type === 'codex-cli') {
+      const provider = createCodexAppServer({
+        defaultSettings: {
+          cwd: options.cwd ?? process.cwd(),
+          approvalPolicy: 'on-request',
+          sandboxPolicy: 'read-only',
+          autoApprove: true,
+          mcpServers: {
+            motif: createSdkMcpServer({
+              name: 'motif',
+              tools: Object.entries(options.tools).map(([name, item]) => ({
+                name,
+                description: typeof item.description === 'string' ? item.description : name,
+                inputSchema: toolInputSchema(item.inputSchema),
+                execute: (input: unknown) => item.execute!(input, {} as never),
+              })),
+            }),
+          },
+        },
+      })
+      return {
+        result: streamText({
+          model: provider(options.modelId),
+          prompt: options.chat,
+          instructions: options.system,
+          reasoning: options.reasoningEffort === 'minimal' ? 'low' : options.reasoningEffort,
+          stopWhen: isStepCount(options.maxToolSteps),
+          abortSignal: options.abortSignal,
+        }),
+        close: () => provider.close(),
+      }
+    }
     const model = this.getModel(options.provider, options.modelId)
 
-    return streamText({
-      model,
-      prompt: options.chat,
-      tools: options.tools,
-      instructions: options.system,
-      reasoning: options.reasoningEffort,
-      stopWhen: isStepCount(15),
-      abortSignal: options.abortSignal,
-    })
+    return {
+      result: streamText({
+        model,
+        prompt: options.chat,
+        tools: options.tools,
+        instructions: options.system,
+        reasoning: options.reasoningEffort,
+        stopWhen: isStepCount(options.maxToolSteps),
+        abortSignal: options.abortSignal,
+      }),
+      close: async () => undefined,
+    }
   }
 
   async prepareModel(
@@ -146,6 +186,14 @@ export default class AiService {
   }
 
   async listModels(provider: ProviderConfig): Promise<string[]> {
+    if (provider.type === 'codex-cli') {
+      const codex = createCodexAppServer()
+      try {
+        return (await codex.listModels()).models.map((model) => model.id)
+      } finally {
+        await codex.close()
+      }
+    }
     const baseURL = providerRoot(provider)
     const headers = this.headers(provider)
     if (provider.type === 'lmstudio') {
@@ -533,6 +581,11 @@ export default class AiService {
       signal?.addEventListener('abort', abort, { once: true })
     })
   }
+}
+
+function toolInputSchema(schema: unknown): Record<string, unknown> {
+  if (schema instanceof z.ZodType) return z.toJSONSchema(schema)
+  return schema && typeof schema === 'object' ? (schema as Record<string, unknown>) : {}
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

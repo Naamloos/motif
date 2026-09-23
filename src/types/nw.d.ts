@@ -10,6 +10,7 @@ interface NwWindow {
 }
 
 declare const nw: {
+  require: NodeJS.Require
   App: {
     dataPath: string
   }
@@ -18,5 +19,9 @@ declare const nw: {
   }
   Shell: {
     openExternal(uri: string): void
+  }
+  Clipboard: {
+    get(type?: string): string
+    set(text: string, type?: string): void
   }
 }
