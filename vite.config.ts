@@ -19,6 +19,7 @@ const VIRTUAL_PREFIX = '\0nw-node:'
  */
 const nwRuntimePackages = new Set<string>([
   '@ai-sdk/mcp',
+  'selfsigned',
   'playwright',
   'tesseract.js',
 ])

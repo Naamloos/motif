@@ -44,6 +44,7 @@ type McpDraft = {
   oauthClientId: string
   oauthClientSecret: string
   oauthCallbackPort: string
+  oauthCallbackHttps: boolean
 }
 
 const emptyDraft: McpDraft = {
@@ -58,6 +59,7 @@ const emptyDraft: McpDraft = {
   oauthClientId: '',
   oauthClientSecret: '',
   oauthCallbackPort: String(defaultMcpOAuthCallbackPort),
+  oauthCallbackHttps: false,
 }
 
 function parseLines(value: string) {
@@ -91,6 +93,7 @@ function draftFor(server: McpServerConfig): McpDraft {
     oauthClientId: server.oauthClientId ?? '',
     oauthClientSecret: server.oauthClientSecret ?? '',
     oauthCallbackPort: String(server.oauthCallbackPort ?? defaultMcpOAuthCallbackPort),
+    oauthCallbackHttps: server.oauthCallbackHttps ?? false,
   }
 }
 
@@ -106,6 +109,7 @@ function connectionConfig(server: McpServerConfig) {
     server.oauthClientId,
     server.oauthClientSecret,
     server.oauthCallbackPort,
+    server.oauthCallbackHttps,
   ])
 }
 
@@ -209,6 +213,7 @@ export function McpSettingsSection() {
                     oauthClientId: draft.oauthClientId.trim() || undefined,
                     oauthClientSecret: draft.oauthClientSecret.trim() || undefined,
                     oauthCallbackPort: callbackPort,
+                    oauthCallbackHttps: draft.oauthCallbackHttps,
                   }
                 : {}),
             }),
@@ -225,7 +230,8 @@ export function McpSettingsSection() {
           existing.auth !== server.auth ||
           existing.oauthClientId !== server.oauthClientId ||
           existing.oauthClientSecret !== server.oauthClientSecret ||
-          (existing.oauthCallbackPort ?? defaultMcpOAuthCallbackPort) !== server.oauthCallbackPort)
+          (existing.oauthCallbackPort ?? defaultMcpOAuthCallbackPort) !== server.oauthCallbackPort ||
+          (existing.oauthCallbackHttps ?? false) !== server.oauthCallbackHttps)
       ) {
         clearMcpOAuth(existing.id)
       }
@@ -363,23 +369,25 @@ export function McpSettingsSection() {
                 <div className="space-y-2 border-t pt-3">
                   <p className="text-xs font-medium text-muted-foreground">Available tools</p>
                   {server.availableTools.length ? (
-                    server.availableTools.map((name) => (
-                      <label key={name} className="flex items-center gap-2 text-sm">
-                        <Checkbox
-                          checked={!server.disabledTools?.includes(name)}
-                          onCheckedChange={(checked) =>
-                            updateServer(server.id, (item) => ({
-                              ...item,
-                              disabledTools:
-                                checked === true
-                                  ? item.disabledTools?.filter((tool) => tool !== name)
-                                  : [...(item.disabledTools ?? []), name],
-                            }))
-                          }
-                        />
-                        {name}
-                      </label>
-                    ))
+                    <div className="grid grid-cols-1 gap-x-4 sm:grid-cols-2">
+                      {server.availableTools.map((name) => (
+                        <label key={name} className="flex cursor-pointer items-center gap-3 py-2 text-sm">
+                          <Checkbox
+                            checked={!server.disabledTools?.includes(name)}
+                            onCheckedChange={(checked) =>
+                              updateServer(server.id, (item) => ({
+                                ...item,
+                                disabledTools:
+                                  checked === true
+                                    ? item.disabledTools?.filter((tool) => tool !== name)
+                                    : [...(item.disabledTools ?? []), name],
+                              }))
+                            }
+                          />
+                          {name}
+                        </label>
+                      ))}
+                    </div>
                   ) : (
                     <p className="text-sm text-muted-foreground">This server exposes no tools.</p>
                   )}
@@ -519,7 +527,7 @@ export function McpSettingsSection() {
                       )}
                       <Field
                         label="Callback port"
-                        description={`Register http://127.0.0.1:${draft.oauthCallbackPort || defaultMcpOAuthCallbackPort}/mcp-oauth/callback as the redirect URI when using a client ID.`}
+                        description={`Register ${draft.oauthCallbackHttps ? 'https' : 'http'}://127.0.0.1:${draft.oauthCallbackPort || defaultMcpOAuthCallbackPort}/mcp-oauth/callback as the redirect URI when using a client ID.`}
                       >
                         <Input
                           type="number"
@@ -531,6 +539,20 @@ export function McpSettingsSection() {
                           }
                         />
                       </Field>
+                      <label className="flex items-start gap-2 text-sm">
+                        <Checkbox
+                          checked={draft.oauthCallbackHttps}
+                          onCheckedChange={(checked) =>
+                            setDraft({ ...draft, oauthCallbackHttps: checked === true })
+                          }
+                        />
+                        <span>
+                          Use HTTPS callback
+                          <span className="block text-xs text-muted-foreground">
+                            Uses a local self-signed certificate. To finish sign-in, proceed through the browser warning only for https://127.0.0.1.
+                          </span>
+                        </span>
+                      </label>
                     </>
                   )}
                 </>

@@ -1,5 +1,6 @@
 import MarkdownIt from 'markdown-it'
 import type { ReactElement } from 'react'
+import { McpUiView } from '@/components/mcp-ui-view'
 import {
   ChevronDown,
   Clock3,
@@ -13,7 +14,32 @@ import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip
 import type { AssistantActivity, ChatMessage, ToolTrace } from '@/stores/app-model'
 
 const markdown = new MarkdownIt({ html: false, breaks: true })
-const thinkingTexts = ['Thinking...', 'Yapping...', 'Thunking...', 'Gooning...', 'I uh I uh idk 1 sec...']
+const thinkingTexts = [
+  'Thinking...',
+  'Yapping...',
+  'Thunking...',
+  'Gooning...',
+  'I uh I uh idk 1 sec...',
+  "Hol up...",
+  "Tokening...",
+  "Pondering...",
+  "That's a good question...",
+  "Fuck, hang on...",
+  "Uhhhhhh...",
+  "Wasting GPU cycles...",
+  "Dumb question, but let me think...",
+  "Drinking a shit ton of water...",
+  "Hallucinating bullshit...",
+  "In a fight with Claude...",
+  "Is this thing on?...",
+  "Wasting tokens...",
+  "Crying about RAM prices...",
+  "Being a senior engineer and making no mistakes...",
+  "Awaiting payment...",
+  "I'll look at it tomorrow...",
+  "Routing your request to India...",
+  "sudo rm -rf / --no-preserve-root..."
+]
 
 markdown.renderer.rules.link_open = (tokens, index, options, _env, self) => {
   const token = tokens[index]
@@ -102,33 +128,53 @@ function isDiffOutput(output: string) {
 }
 
 function ToolDetails({ tool, active }: { tool: ToolTrace; active: boolean }) {
+  const app =
+    tool.app ??
+    (() => {
+      try {
+        const output = JSON.parse(tool.output ?? '') as {
+          content?: Array<{ type?: string; resource?: ToolTrace['app'] & { text?: string } }>
+        }
+        const resource = output.content?.find((item) => item.type === 'resource')?.resource
+        return resource?.uri?.startsWith('ui://') &&
+          resource.mimeType &&
+          typeof resource.text === 'string'
+          ? { uri: resource.uri, mimeType: resource.mimeType, html: resource.text }
+          : undefined
+      } catch {
+        return undefined
+      }
+    })()
   return (
-    <details
-      open={active}
-      className={`min-w-0 max-w-full overflow-hidden rounded-lg border px-3 py-2 text-sm ${active ? 'streaming-glow' : ''}`}
-    >
-      <summary className="flex cursor-pointer list-none items-center gap-2">
-        <Wrench className="size-4" aria-hidden="true" />
-        {tool.name} - {tool.status}
-        {active && <LoaderCircle className="ml-auto size-4 animate-spin" aria-label="Running" />}
-      </summary>
-      <div className="mt-3 space-y-2">
-        <div>
-          <p className="text-xs text-muted-foreground">Input</p>
-          <pre className="max-w-full whitespace-pre-wrap break-all">{tool.input || '...'}</pre>
-        </div>
-        {tool.output && (
+    <div className="min-w-0 max-w-full space-y-2">
+      <details
+        open={active}
+        className={`min-w-0 max-w-full overflow-hidden rounded-lg border px-3 py-2 text-sm ${active ? 'streaming-glow' : ''}`}
+      >
+        <summary className="flex cursor-pointer list-none items-center gap-2">
+          <Wrench className="size-4" aria-hidden="true" />
+          {tool.name} - {tool.status}
+          {active && <LoaderCircle className="ml-auto size-4 animate-spin" aria-label="Running" />}
+        </summary>
+        <div className="mt-3 space-y-2">
           <div>
-            <p className="text-xs text-muted-foreground">Output</p>
-            {isDiffOutput(tool.output) ? (
-              <DiffViewer diff={tool.output} />
-            ) : (
-              <pre className="max-w-full whitespace-pre-wrap break-all">{tool.output}</pre>
-            )}
+            <p className="text-xs text-muted-foreground">Input</p>
+            <pre className="max-w-full whitespace-pre-wrap break-all">{tool.input || '...'}</pre>
           </div>
-        )}
-      </div>
-    </details>
+          {tool.output && !app && (
+            <div>
+              <p className="text-xs text-muted-foreground">Output</p>
+              {isDiffOutput(tool.output) ? (
+                <DiffViewer diff={tool.output} />
+              ) : (
+                <pre className="max-w-full whitespace-pre-wrap break-all">{tool.output}</pre>
+              )}
+            </div>
+          )}
+        </div>
+      </details>
+      {app && <McpUiView app={app} tool={tool} />}
+    </div>
   )
 }
 
@@ -177,10 +223,13 @@ function activityFor(message: ChatMessage): AssistantActivity[] {
 }
 
 export function ChatMessageView({ message }: { message: ChatMessage }) {
-  const thinkingText = thinkingTexts[
-    Array.from(message.id).reduce((hash, character) => (hash * 31 + character.charCodeAt(0)) >>> 0, 0) %
-      thinkingTexts.length
-  ]
+  const thinkingText =
+    thinkingTexts[
+      Array.from(message.id).reduce(
+        (hash, character) => (hash * 31 + character.charCodeAt(0)) >>> 0,
+        0,
+      ) % thinkingTexts.length
+    ]
   if (message.role === 'user') {
     return (
       <article className="chat-message space-y-2">
@@ -256,9 +305,7 @@ export function ChatMessageView({ message }: { message: ChatMessage }) {
         {message.error && <p className="text-sm text-destructive">{message.error}</p>}
         {message.runSnapshot && (
           <details className="w-fit px-1 text-xs text-muted-foreground">
-            <summary className="cursor-pointer">
-              Run settings - {message.runSnapshot.model}
-            </summary>
+            <summary className="cursor-pointer">Run settings - {message.runSnapshot.model}</summary>
             <div className="mt-1 space-y-0.5">
               <p>Provider: {message.runSnapshot.provider}</p>
               <p>Reasoning: {message.runSnapshot.reasoningEffort}</p>

@@ -8,6 +8,14 @@ export type ToolTrace = {
   name: string
   input: string
   output?: string
+  app?: {
+    uri: string
+    mimeType: string
+    html: string
+    serverId?: string
+    toolName?: string
+    csp?: { connectDomains?: string[]; resourceDomains?: string[]; frameDomains?: string[] }
+  }
   status: 'input' | 'running' | 'complete' | 'error'
 }
 
@@ -117,7 +125,8 @@ export const defaultSettings: Settings = {
   defaultProviderId: 'lmstudio',
   theme: 'system',
   primaryColor: '',
-  systemPrompt: 'You are motif, a helpful AI assistant. You were built by Naamloos, and your github link is: https://github.com/Naamloos/motif',
+  systemPrompt:
+    'You are motif, a helpful AI assistant. You were built by Naamloos, and your github link is: https://github.com/Naamloos/motif',
   searxngUrl: '',
   mcpServers: [],
   enabledTools: {
@@ -182,6 +191,22 @@ const toolTraceSchema = z.object({
   name: z.string(),
   input: z.string(),
   output: z.string().optional(),
+  app: z
+    .object({
+      uri: z.string(),
+      mimeType: z.string(),
+      html: z.string(),
+      serverId: z.string().optional(),
+      toolName: z.string().optional(),
+      csp: z
+        .object({
+          connectDomains: z.array(z.string()).optional(),
+          resourceDomains: z.array(z.string()).optional(),
+          frameDomains: z.array(z.string()).optional(),
+        })
+        .optional(),
+    })
+    .optional(),
   status: z.enum(['input', 'running', 'complete', 'error']),
 })
 
@@ -211,29 +236,31 @@ const chatMessageSchema = z.object({
   outputTokens: z.number().int().nonnegative().optional(),
   isStreaming: z.boolean().optional(),
   activeActivityId: z.string().nullable().optional(),
-  runSnapshot: z.object({
-    provider: z.string(),
-    model: z.string(),
-    reasoningEffort: z.enum([
-      'provider-default',
-      'none',
-      'minimal',
-      'low',
-      'medium',
-      'high',
-      'xhigh',
-    ]),
-    maxToolSteps: z.number(),
-    enabledTools: z.array(z.string()),
-    contextTurns: z.number(),
-    systemPrompt: z.string(),
-    memories: z.array(z.string()),
-    workspaceFolder: z.string().optional(),
-    approvalForFileChanges: z.boolean(),
-    approvalForMcpTools: z.boolean(),
-    approvalForCommands: z.boolean().default(true),
-    approvalForBrowser: z.boolean().default(true),
-  }).optional(),
+  runSnapshot: z
+    .object({
+      provider: z.string(),
+      model: z.string(),
+      reasoningEffort: z.enum([
+        'provider-default',
+        'none',
+        'minimal',
+        'low',
+        'medium',
+        'high',
+        'xhigh',
+      ]),
+      maxToolSteps: z.number(),
+      enabledTools: z.array(z.string()),
+      contextTurns: z.number(),
+      systemPrompt: z.string(),
+      memories: z.array(z.string()),
+      workspaceFolder: z.string().optional(),
+      approvalForFileChanges: z.boolean(),
+      approvalForMcpTools: z.boolean(),
+      approvalForCommands: z.boolean().default(true),
+      approvalForBrowser: z.boolean().default(true),
+    })
+    .optional(),
 })
 
 export const persistedDataSchema = z.object({
@@ -268,6 +295,7 @@ export const persistedDataSchema = z.object({
           oauthClientId: z.string().optional(),
           oauthClientSecret: z.string().optional(),
           oauthCallbackPort: z.number().int().min(1024).max(65535).optional(),
+          oauthCallbackHttps: z.boolean().optional(),
           disabledTools: z.array(z.string()).optional(),
           availableTools: z.array(z.string()).optional(),
         }),

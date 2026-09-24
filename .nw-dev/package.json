@@ -1,9 +1,9 @@
 {
     "name": "motif",
-    "main": "http://127.0.0.1:5173",
+    "main": "http://127.0.0.1:5500",
     "nodejs": true,
     "node-remote": [
-        "http://127.0.0.1:5173/*"
+        "http://127.0.0.1:5500/*"
     ],
     "window": {
         "title": "Motif",

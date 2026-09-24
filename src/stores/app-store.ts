@@ -36,6 +36,7 @@ import {
   type Chat,
   type ChatImage,
   type ChatMessage,
+  type ToolTrace,
   type Settings,
   type RunSettingsSnapshot,
 } from '@/stores/app-model'
@@ -58,9 +59,18 @@ let initializing = false
 
 function formatValue(value: unknown): string {
   if (typeof value === 'string') return value
-  if (value instanceof Error) {
-    const cause: string = 'cause' in value && value.cause ? `\nCaused by: ${formatValue(value.cause)}` : ''
-    return `${value.name}: ${value.message || 'Unknown error'}${cause}`
+  if (value && typeof value === 'object' && 'name' in value && 'message' in value) {
+    const error = value as {
+      name: unknown
+      message: unknown
+      cause?: unknown
+      code?: unknown
+      data?: unknown
+    }
+    const cause = error.cause ? `\nCaused by: ${formatValue(error.cause)}` : ''
+    const code = error.code !== undefined ? `\nCode: ${String(error.code)}` : ''
+    const data = error.data !== undefined ? `\nDetails: ${formatValue(error.data)}` : ''
+    return `${String(error.name)}: ${String(error.message) || 'Unknown error'}${code}${data}${cause}`
   }
   if (value && typeof value === 'object' && 'image' in value && typeof value.image === 'string')
     return '[image]'
@@ -185,7 +195,8 @@ async function compactMessages(
     cwd: chat.workspaceFolder,
     reasoningEffort: 'none',
     maxToolSteps: 1,
-    system: 'Summarize the conversation so far for future use. Preserve the user’s goals, decisions, preferences, important facts, and unresolved work. Be concise. Return only the summary.',
+    system:
+      'Summarize the conversation so far for future use. Preserve the user’s goals, decisions, preferences, important facts, and unresolved work. Be concise. Return only the summary.',
     chat: messages.slice(0, keepFrom),
     tools: {},
     abortSignal,
@@ -197,7 +208,10 @@ async function compactMessages(
     await generation.close()
   }
   return summary.trim()
-    ? [{ role: 'system' as const, content: `Earlier conversation summary:\n${summary.trim()}` }, ...messages.slice(keepFrom)]
+    ? [
+        { role: 'system' as const, content: `Earlier conversation summary:\n${summary.trim()}` },
+        ...messages.slice(keepFrom),
+      ]
     : messages
 }
 
@@ -243,9 +257,7 @@ function createGenerationTools(
                 chatTitle,
                 action: title,
                 details:
-                  description.length <= 4_000
-                    ? description
-                    : `${description.slice(0, 4_000)}...`,
+                  description.length <= 4_000 ? description : `${description.slice(0, 4_000)}...`,
                 approved,
               },
             ],
@@ -278,9 +290,7 @@ function createGenerationTools(
       const current = useAppStore.getState()
       if (!current.settings.memories.includes(memory)) return false
       current.updateSettings({
-        memories: current.settings.memories.map((item) =>
-          item === memory ? replacement : item,
-        ),
+        memories: current.settings.memories.map((item) => (item === memory ? replacement : item)),
       })
       return true
     },
@@ -337,6 +347,43 @@ function createGenerationTools(
   }
 }
 
+function findMcpUiResource(value: unknown): ToolTrace['app'] | undefined {
+  if (!value || typeof value !== 'object' || !('content' in value) || !Array.isArray(value.content))
+    return
+  for (const item of value.content) {
+    if (!item || typeof item !== 'object' || !('type' in item)) continue
+    const resource = item.type === 'resource' && 'resource' in item ? item.resource : item
+    if (
+      !resource ||
+      typeof resource !== 'object' ||
+      !('uri' in resource) ||
+      typeof resource.uri !== 'string' ||
+      !('mimeType' in resource) ||
+      typeof resource.mimeType !== 'string'
+    )
+      continue
+    const html =
+      'text' in resource && typeof resource.text === 'string'
+        ? resource.text
+        : 'blob' in resource && typeof resource.blob === 'string'
+          ? atob(resource.blob)
+          : undefined
+    const externalUrl =
+      resource.mimeType === 'text/uri-list'
+        ? html?.split(/\r?\n/).find((line: string) => /^https?:\/\//.test(line.trim()))
+        : undefined
+    if (
+      html !== undefined &&
+      (resource.uri.startsWith('ui://') ||
+        resource.mimeType.includes('mcp-ui') ||
+        resource.mimeType === 'text/html;profile=mcp-app')
+    ) {
+      return { uri: resource.uri, mimeType: resource.mimeType, html: externalUrl ?? html }
+    }
+  }
+  return
+}
+
 function createSystemPrompt(settings: Settings, chat: Chat) {
   const displayName = getCurrentDisplayName()
   const instructions = [settings.systemPrompt, chat.instructions].filter(Boolean).join('\n\n')
@@ -367,7 +414,9 @@ function createSystemPrompt(settings: Settings, chat: Chat) {
 
   const sections = [instructions, runtimeContext.join('\n')]
   if (chat.useMemories && settings.memories.length) {
-    sections.push(`User-approved memories:\n${settings.memories.map((memory) => `- ${memory}`).join('\n')}`)
+    sections.push(
+      `User-approved memories:\n${settings.memories.map((memory) => `- ${memory}`).join('\n')}`,
+    )
   }
   return sections.filter(Boolean).join('\n\n')
 }
@@ -434,7 +483,8 @@ async function runGeneration(
         cwd: chat.workspaceFolder,
         reasoningEffort: 'none',
         maxToolSteps: 1,
-        system: 'Generate a concise title for the conversation from the user’s first message. Return only the title, with no quotation marks or explanation. Keep it under 8 words.',
+        system:
+          'Generate a concise title for the conversation from the user’s first message. Return only the title, with no quotation marks or explanation. Keep it under 8 words.',
         chat: [{ role: 'user', content: userMessage.text }],
         tools: {},
         abortSignal: controller.signal,
@@ -445,7 +495,10 @@ async function runGeneration(
       } finally {
         await titleGeneration.close()
       }
-      const generatedTitle = title.trim().replace(/^['"“”]+|['"“”]+$/g, '').slice(0, 64)
+      const generatedTitle = title
+        .trim()
+        .replace(/^['"“”]+|['"“”]+$/g, '')
+        .slice(0, 64)
       if (generatedTitle) {
         updateChat(chatId, (current) => ({
           ...current,
@@ -473,16 +526,20 @@ async function runGeneration(
       settings.providers,
     )
     if (controller.signal.aborted) throw controller.signal.reason
-    const mcpSession = await createMcpToolSession(settings.mcpServers, (id, error, tools) => {
-      useAppStore.setState((state) => ({
-        mcpServerStatus: {
-          ...state.mcpServerStatus,
-          [id]: { ...state.mcpServerStatus[id], error, tools, loading: false },
-        },
-      }))
-      const server = settings.mcpServers.find((item) => item.id === id)
-      if (server && tools) rememberMcpTools(server, tools)
-    })
+    const mcpSession = await createMcpToolSession(
+      settings.mcpServers,
+      (id, error, tools) => {
+        useAppStore.setState((state) => ({
+          mcpServerStatus: {
+            ...state.mcpServerStatus,
+            [id]: { ...state.mcpServerStatus[id], error, tools, loading: false },
+          },
+        }))
+        const server = settings.mcpServers.find((item) => item.id === id)
+        if (server && tools) rememberMcpTools(server, tools)
+      },
+      chat.workspaceFolder,
+    )
     closeMcp = mcpSession.close
     if (controller.signal.aborted) throw controller.signal.reason
     generationStartedAt = Date.now()
@@ -606,18 +663,33 @@ async function runGeneration(
                 ],
           }))
           break
-        case 'tool-result':
+        case 'tool-result': {
           if (import.meta.env.DEV) console.info('[tool] complete', part.toolCallId)
+          const returnedApp = findMcpUiResource(part.output)
+          const linkedApp = mcpSession.apps[part.toolName]
+          const app = returnedApp
+            ? {
+                ...returnedApp,
+                serverId: mcpSession.serversByTool[part.toolName],
+                toolName: linkedApp?.toolName,
+              }
+            : linkedApp
           updateAssistant(chatId, assistantMessage.id, (message) => ({
             ...message,
             activeActivityId: null,
             tools: message.tools.map((tool) =>
               tool.id === part.toolCallId
-                ? { ...tool, output: formatValue(part.output), status: 'complete' }
+                ? {
+                    ...tool,
+                    output: formatValue(part.output),
+                    app: tool.app ?? app,
+                    status: 'complete',
+                  }
                 : tool,
             ),
           }))
           break
+        }
         case 'tool-error':
           updateAssistant(chatId, assistantMessage.id, (message) => ({
             ...message,
@@ -708,7 +780,9 @@ async function runGeneration(
         generationStatus: 'queued',
       }
     })
-    if (useAppStore.getState().chats.find((item) => item.id === chatId)?.generationStatus === 'queued') {
+    if (
+      useAppStore.getState().chats.find((item) => item.id === chatId)?.generationStatus === 'queued'
+    ) {
       queueRunSnapshot(chatId)
     }
   }
@@ -738,7 +812,10 @@ type AppState = {
   updateChat: (
     chatId: string,
     updates: Partial<
-      Pick<Chat, 'instructions' | 'enabledTools' | 'useMemories' | 'pinned' | 'archived' | 'maxToolSteps'>
+      Pick<
+        Chat,
+        'instructions' | 'enabledTools' | 'useMemories' | 'pinned' | 'archived' | 'maxToolSteps'
+      >
     >,
   ) => void
   deleteChat: (chatId: string) => void
@@ -812,13 +889,15 @@ export const useAppStore = create<AppState>((set) => ({
   mcpServerStatus: {},
 
   checkMcpServer: async (id) => {
-    const server = useAppStore.getState().settings.mcpServers.find((item) => item.id === id)
+    const state = useAppStore.getState()
+    const server = state.settings.mcpServers.find((item) => item.id === id)
     if (!server) return
+    const cwd = state.chats.find((chat) => chat.id === state.activeChatId)?.workspaceFolder
     set((state) => ({
       mcpServerStatus: { ...state.mcpServerStatus, [id]: { loading: true, error: null } },
     }))
     try {
-      const tools = await inspectMcpServer(server)
+      const tools = await inspectMcpServer(server, cwd)
       set((state) => ({
         mcpServerStatus: { ...state.mcpServerStatus, [id]: { loading: false, error: null, tools } },
       }))
@@ -911,7 +990,7 @@ export const useAppStore = create<AppState>((set) => ({
         message.tools.map((tool) => [tool.id, crypto.randomUUID()] as const),
       ),
     )
-  const duplicate: Chat = {
+    const duplicate: Chat = {
       ...source,
       id: crypto.randomUUID(),
       title: `${source.title} copy`,
@@ -972,8 +1051,7 @@ export const useAppStore = create<AppState>((set) => ({
     pumpGenerationQueue()
   },
 
-  clearChatContext: (chatId) =>
-    updateChat(chatId, (chat) => ({ ...chat, modelMessages: [] })),
+  clearChatContext: (chatId) => updateChat(chatId, (chat) => ({ ...chat, modelMessages: [] })),
 
   trimChatContext: (chatId) => {
     const limit = useAppStore.getState().settings.contextTurnLimit

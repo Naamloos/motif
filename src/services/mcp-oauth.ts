@@ -1,5 +1,6 @@
-import { randomBytes } from 'node:crypto'
-import { createServer } from 'node:http'
+import { randomBytes, X509Certificate } from 'node:crypto'
+import { createServer, type RequestListener } from 'node:http'
+import { createServer as createHttpsServer, request as httpsRequest } from 'node:https'
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import {
@@ -9,6 +10,7 @@ import {
   type OAuthClientProvider,
   type OAuthTokens,
 } from '@ai-sdk/mcp'
+import { generate } from 'selfsigned'
 import type { McpServerConfig } from '@/services/mcp-service'
 
 type Credentials = {
@@ -22,8 +24,94 @@ type Credentials = {
 }
 
 const credentialsFile = join(nw.App.dataPath, 'motif-mcp-oauth.json')
+const callbackCertificateFile = join(nw.App.dataPath, 'motif-mcp-oauth-localhost-cert.json')
 const callbackTimeoutMs = 120_000
 export const defaultMcpOAuthCallbackPort = 8765
+
+async function callbackCertificate(): Promise<{ key: string; cert: string }> {
+  let saved: { key: string; cert: string } | undefined
+  try {
+    saved = JSON.parse(readFileSync(callbackCertificateFile, 'utf8'))
+  } catch (error) {
+    if (!error || typeof error !== 'object' || !('code' in error) || error.code !== 'ENOENT') {
+      throw error
+    }
+  }
+  if (saved && typeof saved.key === 'string' && typeof saved.cert === 'string') {
+    try {
+      if (Date.parse(new X509Certificate(saved.cert).validTo) > Date.now() + 86_400_000) {
+        return saved
+      }
+    } catch {
+      // Replace an invalid or expired certificate.
+    }
+  }
+  const generated = await generate([{ name: 'commonName', value: 'localhost' }], {
+    algorithm: 'sha256',
+    extensions: [
+      { name: 'basicConstraints', cA: false },
+      { name: 'keyUsage', digitalSignature: true, keyEncipherment: true },
+      { name: 'extKeyUsage', serverAuth: true },
+      { name: 'subjectAltName', altNames: [{ type: 7, ip: '127.0.0.1' }] },
+    ],
+  })
+  const certificate = { key: generated.private, cert: generated.cert }
+  mkdirSync(nw.App.dataPath, { recursive: true })
+  const temporaryFile = `${callbackCertificateFile}.tmp`
+  writeFileSync(temporaryFile, JSON.stringify(certificate), { mode: 0o600 })
+  renameSync(temporaryFile, callbackCertificateFile)
+  return certificate
+}
+
+// NW.js serves modules over HTTP, which breaks the SDK's Node fetch helper.
+// Calendly's documented OAuth hosts are fixed, so use Node HTTPS for this flow.
+const calendlyOAuthFetch: typeof fetch = async (input, init) => {
+  const url = new URL(input instanceof Request ? input.url : String(input))
+  if (url.protocol !== 'https:' || !['mcp.calendly.com', 'calendly.com'].includes(url.hostname)) {
+    throw new Error(`Unexpected Calendly OAuth host: ${url.origin}`)
+  }
+  const body = init?.body?.toString()
+  const headers = new Headers(init?.headers)
+  if (body !== undefined) headers.set('Content-Length', String(Buffer.byteLength(body)))
+  const response = await new Promise<Response>((resolve, reject) => {
+    const request = httpsRequest(
+      url,
+      {
+        method: init?.method ?? 'GET',
+        headers: Object.fromEntries(headers),
+        signal: init?.signal ?? undefined,
+      },
+      (incoming) => {
+        const chunks: Buffer[] = []
+        incoming.on('data', (chunk: Buffer) => chunks.push(chunk))
+        incoming.on('error', reject)
+        incoming.on('end', () => {
+          const responseHeaders = new Headers()
+          for (let i = 0; i < incoming.rawHeaders.length; i += 2) {
+            responseHeaders.append(incoming.rawHeaders[i], incoming.rawHeaders[i + 1])
+          }
+          const status = incoming.statusCode ?? 500
+          resolve(
+            new Response([204, 205, 304].includes(status) ? null : Buffer.concat(chunks).toString('utf8'), {
+              status,
+              statusText: incoming.statusMessage,
+              headers: responseHeaders,
+            }),
+          )
+        })
+      },
+    )
+    request.on('error', reject)
+    request.end(body)
+  })
+  if (init?.redirect === 'error' && response.status >= 300 && response.status < 400) {
+    throw new TypeError(`OAuth request redirected: ${url.origin}${url.pathname}`)
+  }
+  // The SDK's error parser misses Response objects from another fetch realm in NW.js.
+  if (response.ok || init?.method !== 'POST') return response
+  const errorBody = (await response.text()).slice(0, 2000)
+  throw new Error(`OAuth request to ${url.origin}${url.pathname} failed (HTTP ${response.status}): ${errorBody}`)
+}
 
 export function assertMcpOAuthServerUrl(url: URL) {
   if (
@@ -77,7 +165,10 @@ export function mcpOAuthProvider(
   server: McpServerConfig,
   redirectUrl?: string,
 ): OAuthClientProvider {
-  const callback = redirectUrl ?? savedFor(server)?.redirectUrl ?? 'http://127.0.0.1/callback'
+  const callback =
+    redirectUrl ??
+    savedFor(server)?.redirectUrl ??
+    `${server.oauthCallbackHttps ? 'https' : 'http'}://127.0.0.1/callback`
   return {
     get redirectUrl() {
       return callback
@@ -87,6 +178,9 @@ export function mcpOAuthProvider(
         redirect_uris: [callback],
         application_type: 'native' as const,
         client_name: 'Motif',
+        grant_types: ['authorization_code'],
+        response_types: ['code'],
+        token_endpoint_auth_method: 'none',
       }
     },
     tokens: () => savedFor(server)?.tokens,
@@ -132,6 +226,7 @@ export async function signInMcpServer(server: McpServerConfig): Promise<void> {
     throw new Error('OAuth is only available for remote MCP servers configured to use it.')
   }
   assertMcpOAuthServerUrl(new URL(server.url))
+  const fetchFn = new URL(server.url).hostname === 'mcp.calendly.com' ? calendlyOAuthFetch : undefined
 
   const callbackPath = '/mcp-oauth/callback'
   let resolveCallback!: () => void
@@ -144,7 +239,7 @@ export async function signInMcpServer(server: McpServerConfig): Promise<void> {
   void callback.catch(() => {})
   let provider: OAuthClientProvider
   let callbackHandled = false
-  const listener = createServer((request, response) => {
+  const handleCallback: RequestListener = (request, response) => {
     const url = new URL(request.url ?? '/', 'http://127.0.0.1')
     if (request.method !== 'GET' || url.pathname !== callbackPath) {
       response.writeHead(404).end()
@@ -173,6 +268,7 @@ export async function signInMcpServer(server: McpServerConfig): Promise<void> {
       authorizationCode: code,
       callbackState: url.searchParams.get('state') ?? undefined,
       callbackIssuer: url.searchParams.get('iss') ?? undefined,
+      fetchFn,
     }).then(
       (result) => {
         if (result !== 'AUTHORIZED' || !hasMcpOAuthTokens(server)) {
@@ -193,7 +289,10 @@ export async function signInMcpServer(server: McpServerConfig): Promise<void> {
         rejectCallback(reason instanceof Error ? reason : new Error(String(reason)))
       },
     )
-  })
+  }
+  const listener = server.oauthCallbackHttps
+    ? createHttpsServer(await callbackCertificate(), handleCallback)
+    : createServer(handleCallback)
 
   try {
     await new Promise<void>((resolve, reject) => {
@@ -202,13 +301,13 @@ export async function signInMcpServer(server: McpServerConfig): Promise<void> {
     })
     const address = listener.address()
     if (!address || typeof address === 'string') throw new Error('Could not start OAuth callback.')
-    const redirectUrl = `http://127.0.0.1:${address.port}${callbackPath}`
+    const redirectUrl = `${server.oauthCallbackHttps ? 'https' : 'http'}://127.0.0.1:${address.port}${callbackPath}`
 
     // A dynamic registration is tied to its exact redirect URI. Re-register on a new sign-in.
     clearMcpOAuth(server.id)
     updateCredentials(server, { redirectUrl })
     provider = mcpOAuthProvider(server, redirectUrl)
-    const result = await auth(provider, { serverUrl: server.url })
+    const result = await auth(provider, { serverUrl: server.url, fetchFn })
     if (result === 'REDIRECT') {
       const timeout = setTimeout(
         () => rejectCallback(new Error('MCP sign-in timed out.')),
